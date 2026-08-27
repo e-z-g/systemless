@@ -550,7 +550,7 @@ fn rasterize_resource_outline_face(font_id: i16, size: i16) -> Option<&'static F
                 // costs a little weight at small sizes, which is much the
                 // lesser evil, and it cannot affect the baked faces, whose
                 // coverage is already 0 or 255.
-                const OUTLINE_COVERAGE_THRESHOLD: u8 = 96;
+                const OUTLINE_COVERAGE_THRESHOLD: u8 = 64;
                 let value = (value * 255.0).round().clamp(0.0, 255.0) as u8;
                 *pixel = if value >= OUTLINE_COVERAGE_THRESHOLD {
                     255
