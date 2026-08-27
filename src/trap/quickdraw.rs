@@ -12806,6 +12806,27 @@ impl super::TrapDispatcher {
             //   newpixpat_pascal_function_returns_nonnil_handle_and_preserves_stack_across_five_calls
             //   newpixpat_initializes_gray_pattern_and_penpixpat_copies_it
             (true, 0x207) => {
+                // Imaging With QuickDraw (1994), pp. 4-88..4-89: NewPixPat
+                // "calls the NewPixMap function to allocate the pattern's
+                // PixMap record and initialize it to the same settings as the
+                // pixel map of the current GDevice record", sets pat1Data to
+                // 50 percent gray, and "allocates new handles for the PixPat
+                // record's data, expanded data, expanded map, and color table
+                // but does not initialize them; instead, your application must
+                // initialize them." Five handles in total, counting the record.
+                //
+                // Allocating only the record leaves patMap and patData null,
+                // and an application that builds its pattern the documented way
+                // — resizing (**pp).patData and writing through (**pp).patMap —
+                // then writes through null handles. Its pattern never arrives,
+                // and every fill through it falls back to the 50 percent gray in
+                // pat1Data. Cythera's SetTilePat builds a 32x32 eight-bit tile
+                // exactly that way, so its dialog backgrounds came out as a grey
+                // dither over the text they were meant to sit behind.
+                //
+                // PixPat record, IM:V V-72 / Imaging 4-58:
+                //   +0 patType  +2 patMap  +6 patData  +10 patXData
+                //   +14 patXValid  +16 patXMap  +20 pat1Data (8 bytes)
                 let sp = cpu.read_reg(Register::A7);
                 let rec = bus.alloc(28);
                 if rec != 0 {
@@ -12814,6 +12835,49 @@ impl super::TrapDispatcher {
                     }
                     bus.write_word(rec, 1); // patType = 1 (color)
                     bus.write_bytes(rec + 20, &[0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55]);
+
+                    // patMap: a PixMap cloned from TheGDevice's gdPMap, as
+                    // NewPixMap ($AA03) above builds one.
+                    let gd_handle = self.ensure_main_gdevice(bus);
+                    let gd_ptr = bus.read_long(gd_handle);
+                    let gd_pmap_handle = bus.read_long(gd_ptr + 22);
+                    let gd_pmap = bus.read_long(gd_pmap_handle);
+                    let pm_ptr = bus.alloc(50);
+                    if pm_ptr != 0 {
+                        for i in 0..50u32 {
+                            bus.write_byte(pm_ptr + i, bus.read_byte(gd_pmap + i));
+                        }
+                        bus.write_long(pm_ptr, 0); // baseAddr — the app sets this
+                        let depth = bus.read_word(pm_ptr + 32) as u32;
+                        let source_ctab_handle = bus.read_long(pm_ptr + 42);
+                        let ctab_handle =
+                            self.allocate_color_table_handle(bus, depth, source_ctab_handle, 0x8000);
+                        bus.write_long(pm_ptr + 42, ctab_handle);
+                        let pm_handle = bus.alloc(4);
+                        if pm_handle != 0 {
+                            bus.write_long(pm_handle, pm_ptr);
+                            bus.write_long(rec + 2, pm_handle);
+                        }
+                    }
+
+                    // patData, patXData and patXMap: real but uninitialized
+                    // handles, sized so the application's SetHandleSize has
+                    // something to resize. patXValid = -1 marks the expanded
+                    // data as not yet built.
+                    for (offset, size) in [(6u32, 8u32), (10, 8), (16, 8)] {
+                        let data_ptr = bus.alloc(size);
+                        if data_ptr != 0 {
+                            for i in 0..size {
+                                bus.write_byte(data_ptr + i, 0);
+                            }
+                            let data_handle = bus.alloc(4);
+                            if data_handle != 0 {
+                                bus.write_long(data_handle, data_ptr);
+                                bus.write_long(rec + offset, data_handle);
+                            }
+                        }
+                    }
+                    bus.write_word(rec + 14, 0xFFFF); // patXValid = -1
                 }
                 let handle = bus.alloc(4);
                 bus.write_long(handle, rec);
