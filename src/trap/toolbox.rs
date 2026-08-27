@@ -3390,7 +3390,24 @@ impl super::TrapDispatcher {
                 Self::scriptutil_pixels_to_width_like(width_raw, remaining),
             );
         }
-        bus.write_word(sp + 32, result);
+        // StyledLineBreakCode is a Pascal enumerated type with three values
+        // (smBreakWord, smBreakChar, smBreakOverflow), so it is byte-sized —
+        // Inside Macintosh: Text (1993) declares it as
+        // `StyledLineBreakCode = {BreakWord, BreakChar, BreakOverflow}`.
+        //
+        // A byte-sized Pascal result still occupies a two-byte, word-aligned
+        // slot, and the value goes in the HIGH byte: callers read it back with
+        // `MOVE.B (SP)+,D0`, which takes the byte at the slot's own address and
+        // advances A7 by two. Writing the value as a word puts it in the low
+        // byte, where such a caller reads the zero half instead and sees
+        // smBreakWord no matter what was returned.
+        //
+        // Cythera's intro narration loops on exactly that: it lays the
+        // paragraph out a line at a time and leaves the loop only when this
+        // returns smBreakOverflow (2) for the empty run past the end of the
+        // text. Reading 0 forever, it never leaves, and the intro text never
+        // appears.
+        bus.write_word(sp + 32, result << 8);
         cpu.write_reg(Register::D0, u32::from(result));
         cpu.write_reg(Register::A7, sp + 32);
         Ok(())
@@ -31780,7 +31797,9 @@ mod tests {
         assert!(result.is_some());
         assert!(result.unwrap().is_ok());
 
-        assert_eq!(bus.read_word(sp + 32), 2); // smBreakOverflow
+        // StyledLineBreakCode is byte-sized, returned in the high byte of
+        // its two-byte slot — which is the byte a `MOVE.B (SP)+` caller reads.
+        assert_eq!(bus.read_byte(sp + 32), 2); // smBreakOverflow
         assert_eq!(bus.read_long(offset_ptr), text.len() as u32);
         assert_eq!(bus.read_long(width_ptr), 20u32 << 16);
         assert_eq!(cpu.read_reg(Register::A7), sp + 32);
@@ -31856,7 +31875,7 @@ mod tests {
         assert!(result.is_some());
         assert!(result.unwrap().is_ok());
 
-        assert_eq!(bus.read_word(sp + 32), 1); // smBreakChar
+        assert_eq!(bus.read_byte(sp + 32), 1); // smBreakChar
         assert_eq!(bus.read_long(offset_ptr), 3);
         assert_eq!(bus.read_long(width_ptr), 0);
         assert_eq!(cpu.read_reg(Register::A7), sp + 32);
