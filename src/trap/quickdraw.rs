@@ -23713,6 +23713,46 @@ impl super::TrapDispatcher {
         }
     }
 
+    /// Resolve a PixPat's `patMap` and `patData` to pointers.
+    ///
+    /// The two record shapes differ in what those fields hold. A compiled
+    /// `'ppat'` resource stores offsets from the start of the PixPat record,
+    /// because a resource has no handles until something makes them. A record
+    /// built by `NewPixPat` stores live handles, which is what Inside
+    /// Macintosh describes and what an application filling in its own pattern
+    /// produces — Imaging With QuickDraw (1994), pp. 4-88..4-89.
+    ///
+    /// Both are worth drawing. Supporting only the resource form sends every
+    /// run-time-built colour pattern down the 1-bit `pat1Data` fallback, which
+    /// for a typical pattern is 50 percent gray.
+    ///
+    /// Returns the pattern's PixMap pointer, its pixel data pointer, and
+    /// whether the PixMap's `pmTable` is a handle (it is, whenever the record
+    /// holds live handles) so the caller can dereference it the same way.
+    fn resolve_pixpat_parts(bus: &MacMemoryBus, pp_ptr: u32) -> Option<(u32, u32, bool)> {
+        let pat_map_field = bus.read_long(pp_ptr + 2);
+        let pat_data_field = bus.read_long(pp_ptr + 6);
+
+        // Resource-relative offsets: patMap sits past the 28-byte record and
+        // patData past the 50-byte PixMap that follows it.
+        if (28..=0x10000).contains(&pat_map_field)
+            && (pat_map_field + 50..=0x200000).contains(&pat_data_field)
+        {
+            return Some((pp_ptr + pat_map_field, pp_ptr + pat_data_field, false));
+        }
+
+        // Otherwise treat them as handles and dereference once.
+        if pat_map_field == 0 || pat_data_field == 0 {
+            return None;
+        }
+        let map_ptr = bus.read_long(pat_map_field);
+        let data_ptr = bus.read_long(pat_data_field);
+        if map_ptr == 0 || data_ptr == 0 {
+            return None;
+        }
+        Some((map_ptr, data_ptr, true))
+    }
+
     pub(super) fn decode_raw_pixpat(
         &self,
         bus: &MacMemoryBus,
@@ -23726,18 +23766,8 @@ impl super::TrapDispatcher {
             return None;
         }
 
-        // Compiled 'ppat' resources keep offsets from the PixPat record;
-        // NewPixPat/MakeRGBPat records keep live handles and deliberately
-        // remain on their existing paths.
-        let pat_map_offset = bus.read_long(pp_ptr + 2);
-        let pat_data_offset = bus.read_long(pp_ptr + 6);
-        if !(28..=0x10000).contains(&pat_map_offset)
-            || !(pat_map_offset + 50..=0x200000).contains(&pat_data_offset)
-        {
-            return None;
-        }
-
-        let pat_map_ptr = pp_ptr + pat_map_offset;
+        let (pat_map_ptr, pat_data_ptr, table_is_handle) =
+            Self::resolve_pixpat_parts(bus, pp_ptr)?;
         let read_map = |base_offset: u32| {
             let row_bytes = u32::from(bus.read_word(pat_map_ptr + base_offset) & 0x3FFF);
             let top = bus.read_word(pat_map_ptr + base_offset + 2) as i16;
@@ -23763,7 +23793,10 @@ impl super::TrapDispatcher {
                 && right > left
                 && matches!(pixel_size, 1 | 2 | 4 | 8)
                 && table_offset != 0
-                && table_offset <= 0x200000
+                // A resource-relative table offset is small; a live pmTable
+                // handle is an ordinary pointer and far larger. Bound only the
+                // form that can be bounded.
+                && (table_is_handle || table_offset <= 0x200000)
         };
         let raw_map = read_map(0);
         let live_map = read_map(4);
@@ -23775,10 +23808,15 @@ impl super::TrapDispatcher {
         } else {
             return None;
         };
-        let clut = self.read_raw_pixpat_color_table(bus, pp_ptr + table_offset)?;
+        let table_ptr = if table_is_handle {
+            bus.read_long(table_offset)
+        } else {
+            pp_ptr + table_offset
+        };
+        let clut = self.read_raw_pixpat_color_table(bus, table_ptr)?;
 
         Some(RawPixPat {
-            data_ptr: pp_ptr + pat_data_offset,
+            data_ptr: pat_data_ptr,
             row_bytes,
             width: i32::from(right) - i32::from(left),
             height: i32::from(bottom) - i32::from(top),
@@ -23832,23 +23870,15 @@ impl super::TrapDispatcher {
             reject!("nil master pointer");
         }
 
-        // 'ppat' resources store offsets from the start of the PixPat
-        // resource instead of live Handles. NewPixPat-created records store
-        // actual handles here; those continue down the pat1Data fallback path.
-        let pat_map_offset = bus.read_long(pp_ptr + 2);
-        let pat_data_offset = bus.read_long(pp_ptr + 6);
-        if !(28..=0x10000).contains(&pat_map_offset)
-            || !(pat_map_offset + 50..=0x200000).contains(&pat_data_offset)
-        {
+        let Some((pat_map_ptr, pat_data_ptr, table_is_handle)) =
+            Self::resolve_pixpat_parts(bus, pp_ptr)
+        else {
             reject!(
-                "unsupported offsets patMap=${:08X} patData=${:08X}",
-                pat_map_offset,
-                pat_data_offset
+                "unresolvable patMap=${:08X} patData=${:08X}",
+                bus.read_long(pp_ptr + 2),
+                bus.read_long(pp_ptr + 6)
             );
-        }
-
-        let pat_map_ptr = pp_ptr + pat_map_offset;
-        let pat_data_ptr = pp_ptr + pat_data_offset;
+        };
         let read_map = |base_offset: u32| {
             let row_bytes = u32::from(bus.read_word(pat_map_ptr + base_offset) & 0x3FFF);
             let top = bus.read_word(pat_map_ptr + base_offset + 2) as i16;
@@ -23874,7 +23904,10 @@ impl super::TrapDispatcher {
                 && i32::from(right) > i32::from(left)
                 && matches!(pixel_size, 1 | 2 | 4 | 8)
                 && table_offset != 0
-                && table_offset <= 0x200000
+                // A resource-relative table offset is small; a live pmTable
+                // handle is an ordinary pointer and far larger. Bound only the
+                // form that can be bounded.
+                && (table_is_handle || table_offset <= 0x200000)
         };
 
         // Raw 'ppat' resources store the pattern map without baseAddr
@@ -23910,10 +23943,15 @@ impl super::TrapDispatcher {
         let src_height = i32::from(src_bottom) - i32::from(src_top);
         let src_width = i32::from(src_right) - i32::from(src_left);
 
-        if table_offset == 0 || table_offset > 0x200000 {
+        if table_offset == 0 || (!table_is_handle && table_offset > 0x200000) {
             reject!("invalid table offset ${:08X}", table_offset);
         }
-        let Some(src_clut) = self.read_raw_pixpat_color_table(bus, pp_ptr + table_offset) else {
+        let table_ptr = if table_is_handle {
+            bus.read_long(table_offset)
+        } else {
+            pp_ptr + table_offset
+        };
+        let Some(src_clut) = self.read_raw_pixpat_color_table(bus, table_ptr) else {
             reject!("invalid color table at offset ${:08X}", table_offset);
         };
 
