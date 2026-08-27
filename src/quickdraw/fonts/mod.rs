@@ -527,7 +527,36 @@ fn rasterize_resource_outline_face(font_id: i16, size: i16) -> Option<&'static F
         outlined.draw(|x, y, value| {
             let index = data_offset + y as usize * usize::from(width) + x as usize;
             if let Some(pixel) = coverage.get_mut(index) {
-                *pixel = (value * 255.0).round().clamp(0.0, 255.0) as u8;
+                // Quantise here, and keep partially-covered pixels.
+                //
+                // Two things make this necessary. This module promises that
+                // "every glyph pixel is exactly 0 or 255" — true of the baked
+                // faces, and not true of a run-time rasterisation — and the
+                // draw path collapses coverage to 1 bit at
+                // MONO_COVERAGE_THRESHOLD (128) anyway on the paths a classic
+                // 8-bit screen uses.
+                //
+                // Thresholding an *unhinted* rasterisation at half coverage
+                // loses strokes. ab_glyph does no hinting and no dropout
+                // control, so a stem narrower than a pixel lands at 30-45%
+                // coverage and disappears, taking pieces of the letter with
+                // it. Apple's rasteriser did dropout control precisely to stop
+                // that. Cythera's Argos A Nouveau is a fine serif face used at
+                // around 13px, where most of its thin strokes fall in that
+                // band: its dialog labels came out visibly eaten away.
+                //
+                // A lower threshold approximates dropout control — a pixel the
+                // outline covers substantially is set rather than dropped. It
+                // costs a little weight at small sizes, which is much the
+                // lesser evil, and it cannot affect the baked faces, whose
+                // coverage is already 0 or 255.
+                const OUTLINE_COVERAGE_THRESHOLD: u8 = 96;
+                let value = (value * 255.0).round().clamp(0.0, 255.0) as u8;
+                *pixel = if value >= OUTLINE_COVERAGE_THRESHOLD {
+                    255
+                } else {
+                    0
+                };
             }
         });
         Glyph {
