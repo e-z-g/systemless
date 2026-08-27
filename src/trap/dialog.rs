@@ -6134,8 +6134,22 @@ impl super::TrapDispatcher {
         // dialogs whose in-bounds items are userItems, since the game draws
         // its own background and the white fill would overwrite that content.
         let game_managed = Self::dialog_is_game_managed(bounds, items);
+        // An application that installs a background pixel pattern has taken
+        // over the dialog's background and will have filled the port itself;
+        // painting a flat colour over it discards that. Inside Macintosh
+        // Volume V, p. V-72 (BackPixPat).
+        //
+        // Cythera's character-creation dialog does exactly this -- FaceADialog
+        // sets BackPixPat to a 32x32 parchment tile and fills the whole port
+        // with it -- but its DITL mixes controls and static text with its
+        // userItems, so the all-userItems test above does not catch it and the
+        // parchment was overwritten with white.
+        let app_owns_background = {
+            let pat = bus.read_long(dialog_ptr.wrapping_add(32));
+            pat != 0 && self.decode_raw_pixpat(bus, pat).is_some()
+        };
         let content_color = self.window_semantic_color(bus, dialog_ptr, 0);
-        if !game_managed {
+        if !game_managed && !app_owns_background {
             if let Some((red, green, blue)) = content_color {
                 let pixel_index =
                     Self::nearest_palette_index(&self.device_clut, [red, green, blue]);
