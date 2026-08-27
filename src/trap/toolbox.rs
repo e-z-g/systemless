@@ -2237,18 +2237,21 @@ impl super::TrapDispatcher {
         tracking: &StandardFileGetTrackingState,
     ) {
         let items = Self::standard_file_get_dialog_items(tracking);
-        self.draw_dialog(
-            bus,
-            tracking.bounds,
-            2,
-            "",
-            &items,
-            STANDARD_FILE_GET_OPEN_ITEM,
-            "",
-            0,
-            false,
-            0,
-        );
+        let bounds = tracking.bounds;
+        self.with_system_font(|disp| {
+            disp.draw_dialog(
+                bus,
+                bounds,
+                2,
+                "",
+                &items,
+                STANDARD_FILE_GET_OPEN_ITEM,
+                "",
+                0,
+                false,
+                0,
+            );
+        });
         let (top, left, _, _) = tracking.bounds;
         let (button_top, button_left, button_bottom, button_right) = STANDARD_FILE_GET_OPEN_RECT;
         let selected_is_openable = tracking
@@ -2754,24 +2757,50 @@ impl super::TrapDispatcher {
         ]
     }
 
+    /// Run `draw` with the text state set to the system font.
+    ///
+    /// Standard File and the other dialogs Systemless puts up itself belong to
+    /// the system, not to the application, and a real one draws in the system
+    /// font whatever the application last set. Inside Macintosh: Files (1992),
+    /// pp. 3-27..3-29 describes them as system-supplied dialogs.
+    ///
+    /// Without this they inherit `tx_font`, so an application that has selected
+    /// its own face gets that face in the Save dialog. Cythera selects Argos A
+    /// Nouveau, and its "Create Player:" prompt and the filename came out in
+    /// it, while the buttons — drawn separately with a fixed face — did not.
+    fn with_system_font<F: FnOnce(&mut Self)>(&mut self, draw: F) {
+        let saved = (self.tx_font, self.tx_face, self.tx_size);
+        self.tx_font = 0; // systemFont (Chicago)
+        self.tx_face = 0;
+        self.tx_size = 12;
+        draw(self);
+        self.tx_font = saved.0;
+        self.tx_face = saved.1;
+        self.tx_size = saved.2;
+    }
+
     fn draw_standard_file_put_dialog(
         &mut self,
         bus: &mut MacMemoryBus,
         tracking: &StandardFilePutTrackingState,
     ) {
         let items = Self::standard_file_put_dialog_items(tracking);
-        self.draw_dialog(
-            bus,
-            tracking.bounds,
-            2,
-            "",
-            &items,
-            STANDARD_FILE_SAVE_ITEM,
-            &tracking.name,
-            STANDARD_FILE_NAME_ITEM,
-            false,
-            0,
-        );
+        let bounds = tracking.bounds;
+        let name = tracking.name.clone();
+        self.with_system_font(|disp| {
+            disp.draw_dialog(
+                bus,
+                bounds,
+                2,
+                "",
+                &items,
+                STANDARD_FILE_SAVE_ITEM,
+                &name,
+                STANDARD_FILE_NAME_ITEM,
+                false,
+                0,
+            );
+        });
         let (top, left, _, _) = tracking.bounds;
         let (button_top, button_left, button_bottom, button_right) = STANDARD_FILE_SAVE_RECT;
         self.draw_button(
