@@ -5371,7 +5371,7 @@ impl TrapDispatcher {
         // NFNT's arbitrary resource ID is meaningful only through its FOND
         // association. Inside Macintosh: Text (1993), pp. 4-13 and 4-95.
         for ((res_type, res_id), _) in fork.resources() {
-            if res_type == b"FONT" || res_type == b"NFNT" {
+            if res_type == b"FONT" || res_type == b"NFNT" || res_type == b"sfnt" {
                 self.register_resource_font_backing(refnum, *res_id);
             }
         }
@@ -5396,7 +5396,13 @@ impl TrapDispatcher {
     }
 
     fn register_resource_font_backing(&self, refnum: u16, font_resource_id: i16) {
-        let Some((res_type, bytes)) = [*b"NFNT", *b"FONT"].iter().find_map(|res_type| {
+        // `sfnt` carries the TrueType outline for a family, and a font may ship
+        // as an outline with no bitmap strike at all — Cythera's Argos A
+        // Nouveau does, as `sfnt` 7289 with `FOND` 1046 beside it. Leaving
+        // `sfnt` out of this scan means such a family is never registered and
+        // QuickDraw silently substitutes a different face for every string the
+        // application draws. Inside Macintosh: Text (1993), pp. 4-97..4-98.
+        let Some((res_type, bytes)) = [*b"NFNT", *b"FONT", *b"sfnt"].iter().find_map(|res_type| {
             self.resource_backing_data
                 .get(&(refnum, *res_type, font_resource_id))
                 .map(|bytes| (*res_type, bytes))
@@ -5423,17 +5429,33 @@ impl TrapDispatcher {
             if association.style & 0x00FF != 0 {
                 continue;
             }
-            let registered = crate::quickdraw::fonts::register_resource_font_strike_for_family(
-                association.family_id,
-                association.size,
-                bytes,
-            );
+            // An outline is registered for the family rather than for one
+            // point size, because it scales to every size the family is asked
+            // for. This mirrors the PowerPC loader's handling in
+            // `ppc_register_vfs_resource_fonts`.
+            let registered = if res_type == *b"sfnt" {
+                crate::quickdraw::fonts::register_resource_outline_font(
+                    association.family_id,
+                    bytes,
+                )
+            } else {
+                crate::quickdraw::fonts::register_resource_font_strike_for_family(
+                    association.family_id,
+                    association.size,
+                    bytes,
+                )
+            };
             if registered && std::env::var_os("SYSTEMLESS_TRACE_FONT_TRAPS").is_some() {
                 eprintln!(
-                    "[FONT] FOND {} maps {}pt style ${:04X} to bitmap resource {}",
+                    "[FONT] FOND {} maps {}pt style ${:04X} to {} resource {}",
                     association.family_id,
                     association.size,
                     association.style,
+                    if res_type == *b"sfnt" {
+                        "outline"
+                    } else {
+                        "bitmap"
+                    },
                     association.font_resource_id,
                 );
             }
