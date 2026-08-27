@@ -2280,6 +2280,13 @@ impl super::TrapDispatcher {
                             );
                         }
                     }
+                    if !matches!(cs_code, 2 | 3 | 4) {
+                        crate::diagnostics::record_stub(
+                            "PBControl",
+                            0xA004,
+                            cs_code as u16 as u32,
+                        );
+                    }
                     bus.write_word(pb + 16, control_result as u16);
                 }
                 cpu.write_reg(Register::D0, control_result);
@@ -2416,6 +2423,14 @@ impl super::TrapDispatcher {
                         }
                     }
 
+                    let status_cs_code = bus.read_word(pb + 26);
+                    if status_cs_code != 8 {
+                        crate::diagnostics::record_stub(
+                            "PBStatus",
+                            0xA005,
+                            u32::from(status_cs_code),
+                        );
+                    }
                     bus.write_word(pb + 16, result as u16); // ioResult mirrors D0
                     cpu.write_reg(Register::D0, result);
                     return Some(Ok(()));

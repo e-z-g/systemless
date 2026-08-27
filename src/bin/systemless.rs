@@ -2562,6 +2562,7 @@ fn run_headless(
     }
 
     eprintln!("[HEADLESS] Completed {} instructions", total);
+    systemless::diagnostics::print_trap_census();
     save_store.sync_save_files_now(&mut runner);
     save_screenshot(&runner, 9999);
 }

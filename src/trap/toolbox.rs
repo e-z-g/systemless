@@ -14903,6 +14903,11 @@ impl super::TrapDispatcher {
                                 4 => bus.write_long(result_sp, 0),
                                 _ => {}
                             }
+                            crate::diagnostics::record_stub(
+                                "ScriptUtil",
+                                0xA8B5,
+                                raw_selector,
+                            );
                             eprintln!(
                                 "[TRAP] ScriptUtil: unhandled encoded selector ${:08X}; popped {} arg bytes",
                                 raw_selector, arg_bytes
@@ -14910,7 +14915,12 @@ impl super::TrapDispatcher {
                             cpu.write_reg(Register::A7, result_sp);
                         } else {
                             // Unknown legacy selector — pop the selector and return.
-                            eprintln!("[TRAP] ScriptUtil: unhandled selector {}", selector);
+                            crate::diagnostics::record_stub(
+                            "ScriptUtil",
+                            0xA8B5,
+                            selector as u32,
+                        );
+                        eprintln!("[TRAP] ScriptUtil: unhandled selector {}", selector);
                             cpu.write_reg(Register::A7, sp + 4);
                         }
                     }

@@ -6965,6 +6965,7 @@ impl TrapDispatcher {
             }
         }
 
+        crate::diagnostics::record_trap(is_tool, trap_num);
         // Track consecutive SANE and TickCount calls.
         // Chain sub-dispatchers: first match wins
         let sp_before = cpu.read_reg(Register::A7);

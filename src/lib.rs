@@ -52,6 +52,7 @@ pub mod audio;
 pub mod binhex;
 pub mod cpu;
 pub mod debug_overlay;
+pub mod diagnostics;
 pub mod disk_image;
 pub mod display;
 mod error;
