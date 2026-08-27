@@ -3413,6 +3413,38 @@ impl super::TrapDispatcher {
         Ok(())
     }
 
+    /// A control's `contrlRect`, as (top, left, bottom, right).
+    /// ControlRecord: contrlNext(4), contrlOwner(4), contrlRect(8).
+    /// Inside Macintosh Volume I (1985), p. I-315.
+    fn control_rect(bus: &MacMemoryBus, control_handle: u32) -> Option<(i16, i16, i16, i16)> {
+        if control_handle == 0 {
+            return None;
+        }
+        let ptr = bus.read_long(control_handle);
+        if ptr == 0 {
+            return None;
+        }
+        let top = bus.read_word(ptr + 8) as i16;
+        let left = bus.read_word(ptr + 10) as i16;
+        let bottom = bus.read_word(ptr + 12) as i16;
+        let right = bus.read_word(ptr + 14) as i16;
+        if bottom <= top || right <= left {
+            return None;
+        }
+        Some((top, left, bottom, right))
+    }
+
+    /// How many rows the list shows at once, for paging. At least one.
+    fn list_visible_rows(
+        states: &std::collections::HashMap<u32, super::dispatch::ListState>,
+        list_handle: u32,
+    ) -> i16 {
+        states
+            .get(&list_handle)
+            .map(|state| (state.visible.2 - state.visible.0).max(1))
+            .unwrap_or(1)
+    }
+
     fn list_no_click_cell() -> (i16, i16) {
         (-1, -1)
     }
@@ -11431,6 +11463,65 @@ impl super::TrapDispatcher {
                         let mut draw_state = None;
                         let mut draw_cells = Vec::new();
 
+                        // A click in the list's own scroll bar scrolls the
+                        // list; LClick tracks the bar itself rather than
+                        // returning it to the application. Inside Macintosh
+                        // Volume IV (1986), pp. IV-265..IV-266.
+                        //
+                        // Without this a list whose view is smaller than its
+                        // data can never be scrolled: the bar draws, the click
+                        // lands outside rView, and nothing happens. Cythera's
+                        // portrait picker is a one-cell view onto a 3x2 list,
+                        // so every portrait except the first was unreachable.
+                        let mut scroll_state = None;
+                        if list_ptr != 0 {
+                            let v_scroll = bus.read_long(list_ptr + Self::LIST_VSCROLL_OFFSET);
+                            if let Some(bar) = Self::control_rect(bus, v_scroll) {
+                                let (top, left, bottom, right) = bar;
+                                if point.0 >= top
+                                    && point.0 < bottom
+                                    && point.1 >= left
+                                    && point.1 < right
+                                {
+                                    // Arrow boxes are one scroll-bar width at
+                                    // each end; the rest of the bar pages.
+                                    let arrow = (right - left).max(1);
+                                    let rows = if point.0 < top.saturating_add(arrow) {
+                                        -1
+                                    } else if point.0 >= bottom.saturating_sub(arrow) {
+                                        1
+                                    } else if point.0
+                                        < top.saturating_add((bottom - top) / 2)
+                                    {
+                                        -Self::list_visible_rows(&self.list_states, list_handle)
+                                    } else {
+                                        Self::list_visible_rows(&self.list_states, list_handle)
+                                    };
+                                    if let Some(state) = self.list_states.get_mut(&list_handle) {
+                                        let before = state.visible;
+                                        Self::set_list_visible_origin(
+                                            state,
+                                            state.visible.0.saturating_add(rows),
+                                            state.visible.1,
+                                        );
+                                        Self::sync_list_state_to_guest(bus, list_handle, state);
+                                        if state.draw_enabled && state.visible != before {
+                                            scroll_state = Some(state.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(state) = scroll_state {
+                            bus.write_word(result_addr, 0);
+                            if self.draw_list_with_ldef(cpu, bus, list_handle, &state, None, 12) {
+                                return Some(Ok(()));
+                            }
+                            self.draw_list_fallback(cpu, bus, &state, None);
+                            cpu.write_reg(Register::A7, result_addr);
+                            return Some(Ok(()));
+                        }
+
                         if let Some(state) = self.list_states.get_mut(&list_handle) {
                             let previous_selected = state.selected.clone();
                             let point_in_view = point.0 >= state.view_rect.0
@@ -12109,13 +12200,36 @@ impl super::TrapDispatcher {
                         let list_handle = bus.read_long(sp + 2);
                         let d_rows = bus.read_word(sp + 6) as i16;
                         let d_cols = bus.read_word(sp + 8) as i16;
+                        // "LScroll ... scrolls the list ... and redraws the
+                        // cells that scroll into view" — Inside Macintosh
+                        // Volume IV, p. IV-269. Moving the origin without
+                        // redrawing leaves the previously visible cells on
+                        // screen, so a scrolled list looks frozen: the scroll
+                        // bar and the list's own state advance while the
+                        // picture does not.
+                        //
+                        // Cythera's portrait picker is a one-cell view onto a
+                        // 3x2 list, so every portrait past the first is only
+                        // ever reachable by scrolling, and none of them
+                        // appeared.
+                        let mut draw_state = None;
                         if let Some(state) = self.list_states.get_mut(&list_handle) {
+                            let before = state.visible;
                             Self::set_list_visible_origin(
                                 state,
                                 state.visible.0.saturating_add(d_rows),
                                 state.visible.1.saturating_add(d_cols),
                             );
                             Self::sync_list_state_to_guest(bus, list_handle, state);
+                            if state.draw_enabled && state.visible != before {
+                                draw_state = Some(state.clone());
+                            }
+                        }
+                        if let Some(state) = draw_state {
+                            if self.draw_list_with_ldef(cpu, bus, list_handle, &state, None, 10) {
+                                return Some(Ok(()));
+                            }
+                            self.draw_list_fallback(cpu, bus, &state, None);
                         }
                         cpu.write_reg(Register::A7, sp + 10);
                     }
