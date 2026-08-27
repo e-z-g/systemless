@@ -2468,13 +2468,71 @@ impl super::TrapDispatcher {
                 let pb = cpu.read_reg(Register::A0);
                 if pb != 0 {
                     let io_ref_num = bus.read_word(pb + 24);
-                    let result = if io_ref_num == 0 {
+                    let mut result = if io_ref_num == 0 {
                         NO_ERR
                     } else if self.synthetic_drivers.contains_key(&io_ref_num) {
                         NO_ERR
                     } else {
                         BAD_UNIT_ERR
                     };
+
+                    // cscGetGamma (csCode=8): hand back the device's current
+                    // gamma table. The counterpart of cscSetGamma below, and
+                    // the call a Gamma Fade cannot start without: GetDevGammaTable
+                    // asks for the table, ramps it down or up, and hands it back
+                    // through cscSetGamma. Without an answer here the caller has
+                    // no table to ramp, so every cscSetGamma that follows fails
+                    // with paramErr and the fade runs without changing anything.
+                    //
+                    // csParam holds a POINTER to the caller's VDGammaRecord, and
+                    // the table pointer is written THROUGH it — into the record's
+                    // csGTable field — not into csParam itself. That is the same
+                    // indirection cscSetGamma reads back below.
+                    //
+                    // GammaTbl layout, Universal Interfaces 3.4 `Video.h`:
+                    //   +0  gVersion    0
+                    //   +2  gType       0 (untyped / no formula)
+                    //   +4  gFormulaSize 0
+                    //   +6  gChanCnt    3 (red, green, blue)
+                    //   +8  gDataCnt    256
+                    //   +10 gDataWidth  8
+                    //   +12 correction data, gChanCnt * gDataCnt bytes
+                    if result == NO_ERR && bus.read_word(pb + 26) == 8 {
+                        const GAMMA_TABLE_BYTES: u32 = 12 + 3 * 256;
+                        if *self.device_gamma_table_ptr == 0 {
+                            *self.device_gamma_table_ptr = bus.alloc(GAMMA_TABLE_BYTES);
+                        }
+                        let table = *self.device_gamma_table_ptr;
+                        if table == 0 {
+                            result = PARAM_ERR;
+                        } else {
+                            bus.write_word(table, 0); // gVersion
+                            bus.write_word(table + 2, 0); // gType
+                            bus.write_word(table + 4, 0); // gFormulaSize
+                            bus.write_word(table + 6, 3); // gChanCnt
+                            bus.write_word(table + 8, 256); // gDataCnt
+                            bus.write_word(table + 10, 8); // gDataWidth
+                            for (channel, ramp) in self.device_gamma.iter().enumerate() {
+                                let base = table + 12 + (channel as u32) * 256;
+                                for (index, value) in ramp.iter().enumerate() {
+                                    bus.write_byte(base + index as u32, *value);
+                                }
+                            }
+                            let vd_gamma_ptr = bus.read_long(pb + 28);
+                            if vd_gamma_ptr == 0 {
+                                result = PARAM_ERR;
+                            } else {
+                                bus.write_long(vd_gamma_ptr, table);
+                                if trace_video_driver_enabled() {
+                                    eprintln!(
+                                        "[VIDEO] cscGetGamma record=${:08X} table=${:08X}",
+                                        vd_gamma_ptr, table
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     bus.write_word(pb + 16, result as u16); // ioResult mirrors D0
                     cpu.write_reg(Register::D0, result);
                     return Some(Ok(()));
