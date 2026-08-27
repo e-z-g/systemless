@@ -14676,6 +14676,41 @@ impl super::TrapDispatcher {
                     0x821C_FFFE => {
                         return Some(self.handle_scriptutil_styled_line_break(bus, cpu, sp));
                     }
+                    // VisibleLength ($84080028): FUNCTION VisibleLength(textPtr: Ptr;
+                    //   textLength: LongInt): LongInt
+                    // Returns the length of the text with trailing white space
+                    // excluded, so a caller measuring a line does not count the
+                    // spaces that fall past the break.
+                    //
+                    // The encoding decodes as a 4-byte result and 8 argument
+                    // bytes, which is what the generic fallback below already
+                    // reported for it. Stack: selector(4), textLength(4),
+                    // textPtr(4), result(4). Pop selector + args; the result
+                    // slot becomes the new top of stack.
+                    //
+                    // Returning zero here — which is what the fallback did —
+                    // is not a neutral answer for this routine. Cythera lays
+                    // out its intro narration by calling this on the paragraph
+                    // and advancing by the result; a zero never advances, so
+                    // the call repeats forever and the text never appears.
+                    0x8408_0028 => {
+                        let text_length = bus.read_long(sp + 4);
+                        let text_ptr = bus.read_long(sp + 8);
+                        let mut visible = text_length;
+                        while visible > 0 {
+                            let byte = bus.read_byte(text_ptr + visible - 1);
+                            // Space, tab, carriage return and line feed. Mac OS
+                            // line endings are CR, so both are worth trimming.
+                            if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                                visible -= 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        bus.write_long(sp + 12, visible);
+                        cpu.write_reg(Register::A7, sp + 12);
+                        return Some(Ok(()));
+                    }
                     _ => {}
                 }
 
