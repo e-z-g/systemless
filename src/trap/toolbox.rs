@@ -3384,7 +3384,19 @@ impl super::TrapDispatcher {
                 );
                 (1u16, char_offset, char_width)
             } else {
-                (0u16, text_start, 0)
+                // Break after at least one character even when this is not the
+                // first style run on the line. Returning text_start unchanged
+                // reports "nothing fits" without advancing, and a caller that
+                // lays text out by looping until the offset moves never
+                // terminates -- Cythera's message log adds a row per attempt.
+                //
+                // Inside Macintosh does not settle the case; Executor's
+                // src/script.c StyledLineBreak always moves the offset, in
+                // both of its first-word branches.
+                let char_offset = (text_start + 1).min(text_end);
+                let char_width =
+                    self.scriptutil_measure_text_range_width(bus, text_ptr, text_start, char_offset);
+                (0u16, char_offset, char_width)
             }
         };
 
