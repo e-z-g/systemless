@@ -24391,10 +24391,60 @@ impl super::TrapDispatcher {
             self.ensure_dialog_background_saved_for_screen_port(bus, port);
         }
 
+        // A rectangle is clipped above by the bounding boxes of visRgn and
+        // clipRgn, which is exact only while both are rectangles. A window
+        // with another window in front of it has a visRgn with a hole in it,
+        // and the hole is invisible to a bounding box: the box of "the screen
+        // minus a window in the middle" is still the whole screen.
+        //
+        // Cythera is the case that shows it. Its main window covers the
+        // screen and sits behind the 640x480 window holding the menu artwork,
+        // and on leaving the start screen it fills its own port with the
+        // desktop tile. On a real Mac that paints nothing, because its visRgn
+        // is entirely occluded; here it erased the artwork and left the
+        // character-creation dialog standing on bare tile.
+        //
+        // Inside Macintosh Volume I, I-296 (CalcVis) and I-149: drawing is
+        // clipped to visRgn ∩ clipRgn, which are regions and not rectangles.
+        let vis_rgn_handle = bus.read_long(port.wrapping_add(24));
+        let clip_rgn_handle = bus.read_long(port.wrapping_add(28));
+        let vis_cache = if Self::region_is_complex(bus, vis_rgn_handle) {
+            Self::build_region_membership_cache(bus, vis_rgn_handle, top, bottom)
+        } else {
+            None
+        };
+        let clip_cache = if Self::region_is_complex(bus, clip_rgn_handle) {
+            Self::build_region_membership_cache(bus, clip_rgn_handle, top, bottom)
+        } else {
+            None
+        };
+
         for y in top..bottom {
             let dy = (y - bounds_top) as u32;
             let tile_y = i32::from(y).rem_euclid(src_height) as u32;
             for x in left..right {
+                if vis_cache.is_some()
+                    && !Self::region_contains_point_cached(
+                        bus,
+                        vis_rgn_handle,
+                        vis_cache.as_ref(),
+                        y,
+                        x,
+                    )
+                {
+                    continue;
+                }
+                if clip_cache.is_some()
+                    && !Self::region_contains_point_cached(
+                        bus,
+                        clip_rgn_handle,
+                        clip_cache.as_ref(),
+                        y,
+                        x,
+                    )
+                {
+                    continue;
+                }
                 let dx = (x - bounds_left) as u32;
                 if dx >= dst_row_bytes {
                     continue;
@@ -33548,6 +33598,94 @@ mod tests {
         assert_eq!(read_surface_pixel(&bus, screen_base, row_bytes, 1, 1), 8);
         assert_eq!(read_surface_pixel(&bus, screen_base, row_bytes, 2, 1), 7);
         assert_eq!(read_surface_pixel(&bus, screen_base, row_bytes, 3, 1), 8);
+    }
+
+    #[test]
+    fn fillcrect_raw_pixpat_skips_a_hole_in_the_ports_visible_region() {
+        // A port's visRgn carries a hole wherever a window in front covers it
+        // (CalcVis, Inside Macintosh Volume I, I-297), and drawing is clipped
+        // to visRgn ∩ clipRgn -- regions, not their bounding boxes (I-149).
+        // Clipping a pattern fill to the boxes alone paints straight through
+        // the hole, because the box of "everything but the middle" is
+        // everything.
+        let (mut d, mut cpu, mut bus) = setup();
+        let row_bytes = 64u32;
+        let screen_base = bus.alloc(row_bytes * 64);
+        bus.fill_zeros(screen_base, row_bytes * 64);
+        d.screen_mode = (screen_base, row_bytes, 64, 64, 8);
+        d.device_clut = [[0, 0, 0]; 256];
+        d.device_clut[7] = [0x1111, 0x0000, 0x0000];
+        d.device_clut[8] = [0x0000, 0x2222, 0x0000];
+        d.device_clut[9] = [0x0000, 0x0000, 0x3333];
+
+        let port = bus.alloc(128);
+        let pixmap_handle = bus.alloc(4);
+        let pixmap = bus.alloc(50);
+        bus.write_long(pixmap_handle, pixmap);
+        bus.write_long(port + 2, pixmap_handle);
+        bus.write_word(port + 6, 0xC000);
+        bus.write_long(pixmap, screen_base);
+        bus.write_word(pixmap + 4, 0x8000 | row_bytes as u16);
+        bus.write_word(pixmap + 6, 0);
+        bus.write_word(pixmap + 8, 0);
+        bus.write_word(pixmap + 10, 64);
+        bus.write_word(pixmap + 12, 64);
+        bus.write_word(pixmap + 32, 8);
+
+        // visRgn is the whole port with a 20x20 hole in the middle, the shape
+        // CalcVis produces for a window with another window in front of it.
+        let vis_handle = bus.alloc(4);
+        let mut rows = vec![vec![0i16, 64]; 64];
+        for row in rows.iter_mut().take(40).skip(20) {
+            *row = vec![0, 20, 40, 64];
+        }
+        assert!(TrapDispatcher::write_region_from_rows(
+            &mut bus,
+            vis_handle,
+            0,
+            &rows
+        ));
+        assert!(TrapDispatcher::region_is_complex(&bus, vis_handle));
+        bus.write_long(port + 24, vis_handle);
+
+        let clip = bus.alloc(10);
+        bus.write_word(clip, 10);
+        bus.write_word(clip + 6, 64);
+        bus.write_word(clip + 8, 64);
+        let clip_handle = bus.alloc(4);
+        bus.write_long(clip_handle, clip);
+        bus.write_long(port + 28, clip_handle);
+
+        d.current_port = port;
+        let globals_ptr = bus.read_long(cpu.read_reg(Register::A5));
+        bus.write_long(globals_ptr, port);
+
+        // The whole port, which is the case that skips the rectangle clip
+        // entirely and so relies on the region test alone.
+        let rect_ptr = bus.alloc(8);
+        write_rect(&mut bus, rect_ptr, 0, 0, 64, 64);
+        let pp_handle = make_raw_color_pixpat_handle(&mut bus);
+
+        bus.write_long(TEST_SP, pp_handle);
+        bus.write_long(TEST_SP + 4, rect_ptr);
+        let result = d.dispatch_quickdraw(true, 0x20E, &mut cpu, &mut bus);
+        assert!(result.unwrap().is_ok());
+
+        assert_ne!(
+            read_surface_pixel(&bus, screen_base, row_bytes, 5, 5),
+            0,
+            "the visible part of the fill must still be painted"
+        );
+        assert_eq!(
+            read_surface_pixel(&bus, screen_base, row_bytes, 30, 30),
+            0,
+            "the hole in visRgn must be left alone"
+        );
+        assert_ne!(
+            read_surface_pixel(&bus, screen_base, row_bytes, 50, 30),
+            0,
+            "the rows below the hole must still be painted"
+        );
     }
 
     #[test]
