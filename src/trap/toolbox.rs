@@ -4621,15 +4621,15 @@ impl super::TrapDispatcher {
             0x28 => (4, 0),  // LDispose
             0x2C => (6, 0),  // LDoDraw
             0x30 => (8, 0),  // LDraw
-            0x34 => (8, 4),  // LFind
+            0x34 => (16, 0), // LFind: VAR offset, VAR len, theCell, lHandle
             0x38 => (16, 0), // LGetCell
             0x3C => (10, 2), // LGetSelect
             0x40 => (4, 4),  // LLastClick
             0x44 => (26, 4), // LNew
-            0x48 => (10, 2), // LNextCell
+            0x48 => (12, 2), // LNextCell: hNext, vNext, VAR theCell, lHandle
             0x4C => (12, 0), // LRect
             0x50 => (8, 0),  // LScroll
-            0x54 => (16, 2), // LSearch
+            0x54 => (18, 2), // LSearch: dataPtr, dataLen, searchProc, VAR theCell, lHandle
             0x58 => (14, 0), // LSetCell
             0x5C => (10, 0), // LSetSelect
             0x60 => (8, 0),  // LSize
@@ -11321,6 +11321,44 @@ impl super::TrapDispatcher {
                     // Copies the contents of a cell into the caller's buffer.
                     // PROCEDURE LGetCell(dataPtr: Ptr; VAR dataLen: INTEGER; theCell: Cell; lHandle: ListHandle);
                     // Inside Macintosh Volume IV, IV-272
+                    // LFind ($0034)
+                    // PROCEDURE LFind(VAR offset, len: INTEGER; theCell: Cell;
+                    //                 lHandle: ListHandle);
+                    // Inside Macintosh Volume IV (1986), p. IV-273: the offset
+                    // and length of the cell's data within the cells handle;
+                    // an empty cell gives len 0. Sixteen argument bytes and no
+                    // result, so the frame pops 18 with the selector word.
+                    //
+                    // The fallback table had this as an eight-byte frame with a
+                    // four-byte result. A caller that saves a register across
+                    // the call and restores it with `(SP)+` then reads its own
+                    // locals back instead: Cythera's TTextOut::CurWidth got its
+                    // `this` pointer replaced by a zero offset, and every line
+                    // its message log printed went to a list at address 4.
+                    0x34 => {
+                        let list_handle = bus.read_long(sp + 2);
+                        let cell = Self::read_stack_point(bus, sp + 6);
+                        let len_ptr = bus.read_long(sp + 10);
+                        let offset_ptr = bus.read_long(sp + 14);
+                        let (offset, len) = self
+                            .list_states
+                            .get(&list_handle)
+                            .cloned()
+                            .and_then(|state| {
+                                self.sync_list_cell_data_handle(bus, list_handle, &state)
+                                    .get(&(cell.0, cell.1))
+                                    .copied()
+                            })
+                            .unwrap_or((0, 0));
+                        if offset_ptr != 0 {
+                            bus.write_word(offset_ptr, offset as u16);
+                        }
+                        if len_ptr != 0 {
+                            bus.write_word(len_ptr, len as u16);
+                        }
+                        cpu.write_reg(Register::A7, sp + 18);
+                        Ok(())
+                    }
                     0x38 => {
                         let list_handle = bus.read_long(sp + 2);
                         let cell = Self::read_stack_point(bus, sp + 6);
@@ -24346,6 +24384,78 @@ mod tests {
         let list_ptr = bus.read_long(list_handle);
         let data_bounds_bottom = bus.read_word(list_ptr + 76) as i16;
         assert_eq!(data_bounds_bottom, 3);
+    }
+
+    // Pack0 / List Manager ($A9E7) — LFind selector $0034
+    // IM:IV 1986 p. IV-273: offset and length of a cell's data; 18-byte frame.
+    #[test]
+    fn pack0_lfind_reports_cell_data_and_pops_its_frame() {
+        let (mut disp, mut cpu, mut bus) = setup();
+        let sp = TEST_SP;
+        let view_rect_ptr = 0x353000u32;
+        let data_bounds_ptr = 0x353100u32;
+        let text_ptr = 0x353200u32;
+        let offset_ptr = 0x353300u32;
+        let len_ptr = 0x353310u32;
+
+        bus.write_word(view_rect_ptr, 0);
+        bus.write_word(view_rect_ptr + 2, 0);
+        bus.write_word(view_rect_ptr + 4, 48);
+        bus.write_word(view_rect_ptr + 6, 80);
+        bus.write_word(data_bounds_ptr, 0);
+        bus.write_word(data_bounds_ptr + 2, 0);
+        bus.write_word(data_bounds_ptr + 4, 2);
+        bus.write_word(data_bounds_ptr + 6, 1);
+
+        bus.write_word(sp, 0x0044); // LNew
+        bus.write_word(sp + 2, 0);
+        bus.write_word(sp + 4, 0);
+        bus.write_word(sp + 6, 0);
+        bus.write_word(sp + 8, 0);
+        bus.write_long(sp + 10, 0x210000);
+        bus.write_word(sp + 14, 0);
+        bus.write_word(sp + 16, 12);
+        bus.write_word(sp + 18, 24);
+        bus.write_long(sp + 20, data_bounds_ptr);
+        bus.write_long(sp + 24, view_rect_ptr);
+        bus.write_long(sp + 28, 0);
+        assert!(disp.dispatch_toolbox(true, 0x1E7, &mut cpu, &mut bus).unwrap().is_ok());
+        let list_handle = bus.read_long(sp + 28);
+
+        // Row 0 empty, row 1 holds "hello".
+        bus.write_bytes(text_ptr, b"hello");
+        cpu.write_reg(Register::A7, sp);
+        bus.write_word(sp, 0x0058); // LSetCell
+        bus.write_long(sp + 2, list_handle);
+        bus.write_word(sp + 6, 1); // cell.v (row)
+        bus.write_word(sp + 8, 0); // cell.h (column)
+        bus.write_word(sp + 10, 5); // dataLen
+        bus.write_long(sp + 12, text_ptr); // dataPtr
+        assert!(disp.dispatch_toolbox(true, 0x1E7, &mut cpu, &mut bus).unwrap().is_ok());
+
+        for (row, expected_len) in [(1i16, 5u16), (0, 0)] {
+            cpu.write_reg(Register::A7, sp);
+            bus.write_word(offset_ptr, 0xBEEF);
+            bus.write_word(len_ptr, 0xBEEF);
+            bus.write_word(sp, 0x0034); // LFind
+            bus.write_long(sp + 2, list_handle);
+            bus.write_word(sp + 6, row as u16); // theCell.v
+            bus.write_word(sp + 8, 0); // theCell.h
+            bus.write_long(sp + 10, len_ptr); // VAR len
+            bus.write_long(sp + 14, offset_ptr); // VAR offset
+            let result = disp.dispatch_toolbox(true, 0x1E7, &mut cpu, &mut bus);
+            assert!(result.is_some());
+            assert!(result.unwrap().is_ok());
+            assert_eq!(cpu.read_reg(Register::A7), sp + 18, "LFind pops its 18-byte frame");
+            assert_eq!(bus.read_word(len_ptr), expected_len, "len for row {row}");
+            if expected_len > 0 {
+                assert_eq!(bus.read_word(offset_ptr), 0, "offset of the only data in the cells handle");
+                let list_ptr = bus.read_long(list_handle);
+                let cells_handle = bus.read_long(list_ptr + 0x50);
+                let cells_ptr = bus.read_long(cells_handle);
+                assert_eq!(bus.read_bytes(cells_ptr, 5), b"hello");
+            }
+        }
     }
 
     // Pack0 / List Manager ($A9E7) — LAddToCell selector $000C
