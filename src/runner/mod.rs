@@ -10576,6 +10576,13 @@ impl FixtureRunner {
 /// `SYSTEMLESS_PPC_GWORLD_DUMP=1`, or `SYSTEMLESS_TRACE_TRAP_TIMING=1`.
 impl Drop for FixtureRunner {
     fn drop(&mut self) {
+        // A run that reaches its instruction budget never halts, and the
+        // question "what was the application doing at the end" is the same
+        // one the tail answers for a halt. Print it here unless the halt
+        // path already did.
+        if !self.halted {
+            trap_tail_print();
+        }
         self.dispatcher.print_trap_histogram(40);
         self.print_opcode_histogram(40);
         self.print_pc_histogram(40);
