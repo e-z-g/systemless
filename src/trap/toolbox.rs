@@ -16907,6 +16907,78 @@ impl super::TrapDispatcher {
                 Ok(())
             }
 
+            // MenuDispatch ($A825) — the Appearance-era Menu Manager
+            // extensions. Selector in the low word of D0, its high byte the
+            // number of argument words (Universal Interfaces Menus.h,
+            // `THREEWORDINLINE(0x303C, sel, 0xA825)`):
+            //
+            //   $020C MenuEvent(inEvent: EventRecordPtr): UInt32          4
+            //   $0503 GetMenuItemCommandID(menu, item,
+            //                              VAR outCommandID): OSErr       10
+            //
+            // MenuEvent is MenuKey for an event record: the menu and item
+            // whose command-key equivalent matches a key-down carrying the
+            // Command modifier, packed as MenuKey packs them, or zero. It is
+            // answered by the MenuKey arm on the event's character, which
+            // keeps one search and one highlight path. GetMenuItemCommandID
+            // answers noErr with a zero ID: Systemless records no command IDs,
+            // and zero is the documented "no command ID" value, on which a
+            // caller falls back to menu and item.
+            //
+            // An application that finds the Appearance Manager present calls
+            // MenuEvent for every key-down before handling it itself, so
+            // skipping this trap loses every keystroke and leaves four bytes
+            // on the stack each time; Cythera's TApp::HandleKeyDown does
+            // exactly that. Selectors not decoded fall through to the
+            // unimplemented log.
+            //
+            // Regression coverage:
+            //   src/trap/toolbox.rs::tests::menu_dispatch_menu_event_and_command_id_pop_their_frames
+            (true, 0x025) => {
+                let selector = cpu.read_reg(Register::D0) & 0xFFFF;
+                let sp = cpu.read_reg(Register::A7);
+                match selector {
+                    0x020C => {
+                        const KEY_DOWN: u16 = 3;
+                        const AUTO_KEY: u16 = 5;
+                        const CMD_KEY: u16 = 0x0100;
+                        let event_ptr = bus.read_long(sp);
+                        let (what, ch, modifiers) = if event_ptr != 0 {
+                            (
+                                bus.read_word(event_ptr),
+                                (bus.read_long(event_ptr + 2) & 0xFF) as u16,
+                                bus.read_word(event_ptr + 14),
+                            )
+                        } else {
+                            (0, 0, 0)
+                        };
+                        if (what == KEY_DOWN || what == AUTO_KEY) && modifiers & CMD_KEY != 0 {
+                            // MenuKey's frame is [char.w][result.l]; the
+                            // pointer's low word has been read and can carry
+                            // the character, and the result slot is shared.
+                            bus.write_word(sp + 2, ch);
+                            cpu.write_reg(Register::A7, sp + 2);
+                            return self.dispatch_menu(true, 0x13E, cpu, bus);
+                        }
+                        bus.write_long(sp + 4, 0);
+                        cpu.write_reg(Register::A7, sp + 4);
+                        cpu.write_reg(Register::D0, 0);
+                        Ok(())
+                    }
+                    0x0503 => {
+                        let out_command_id = bus.read_long(sp);
+                        if out_command_id != 0 {
+                            bus.write_long(out_command_id, 0);
+                        }
+                        bus.write_word(sp + 10, 0);
+                        cpu.write_reg(Register::A7, sp + 10);
+                        cpu.write_reg(Register::D0, 0);
+                        Ok(())
+                    }
+                    _ => return None,
+                }
+            }
+
             // AppearanceDispatch ($AA74) — Appearance Manager.
             //
             // Selector in the low word of D0 (`THREEWORDINLINE(0x303C,
@@ -27837,6 +27909,49 @@ mod tests {
         assert_eq!(cpu.read_reg(Register::A7), sp);
         assert_eq!(bus.read_word(sp), (-619i16) as u16);
         assert_eq!(disp.guest_calls.critical_depth(), 0);
+    }
+
+    #[test]
+    fn menu_dispatch_menu_event_and_command_id_pop_their_frames() {
+        // MenuEvent on a plain key-down (no Command modifier): zero result,
+        // four bytes popped.
+        let (mut disp, mut cpu, mut bus) = setup();
+        let base = cpu.read_reg(Register::A7);
+        let event = bus.alloc(16);
+        bus.write_word(event, 3); // keyDown
+        bus.write_long(event + 2, 0x0B42); // key 11, 'B'
+        bus.write_word(event + 14, 0); // no modifiers
+        let slot = base.wrapping_sub(4);
+        bus.write_long(slot, 0xDEAD_BEEF);
+        let sp = slot.wrapping_sub(4);
+        bus.write_long(sp, event);
+        cpu.write_reg(Register::A7, sp);
+        cpu.write_reg(Register::D0, 0x020C);
+        let result = disp.dispatch_toolbox(true, 0x025, &mut cpu, &mut bus);
+        assert!(result.is_some(), "MenuEvent should be handled");
+        assert!(result.unwrap().is_ok());
+        assert_eq!(cpu.read_reg(Register::A7), slot);
+        assert_eq!(bus.read_long(slot), 0, "no menu item for an unmodified key");
+
+        // GetMenuItemCommandID: ten bytes popped, noErr, zero command ID.
+        let (mut disp, mut cpu, mut bus) = setup();
+        let base = cpu.read_reg(Register::A7);
+        let out_id = bus.alloc(4);
+        bus.write_long(out_id, 0xDEAD_BEEF);
+        let slot = base.wrapping_sub(2);
+        bus.write_word(slot, 0x5A5A);
+        let sp = slot.wrapping_sub(10);
+        bus.write_long(sp, out_id); // VAR outCommandID (last argument)
+        bus.write_word(sp + 4, 2); // item
+        bus.write_long(sp + 6, 0x0040_0000); // menu handle
+        cpu.write_reg(Register::A7, sp);
+        cpu.write_reg(Register::D0, 0x0503);
+        let result = disp.dispatch_toolbox(true, 0x025, &mut cpu, &mut bus);
+        assert!(result.is_some(), "GetMenuItemCommandID should be handled");
+        assert!(result.unwrap().is_ok());
+        assert_eq!(cpu.read_reg(Register::A7), slot);
+        assert_eq!(bus.read_word(slot), 0, "noErr");
+        assert_eq!(bus.read_long(out_id), 0, "no command ID recorded");
     }
 
     #[test]
