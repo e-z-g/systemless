@@ -4230,7 +4230,9 @@ impl TrapDispatcher {
         let is_menu_bar_build_refire = trap_no_autopop == 0xA9C0;
         let is_dialog_refire =
             matches!(trap_no_autopop, 0xA991 | 0xA985 | 0xA986 | 0xA987 | 0xA988);
-        let is_standard_file_refire = trap_no_autopop == 0xA9EA;
+        // $AAA3 is the Image Compression Manager, whose *GetFilePreview
+        // routines are served by the Pack3 get-file tracking loop.
+        let is_standard_file_refire = matches!(trap_no_autopop, 0xA9EA | 0xAAA3);
         let is_control_refire = trap_no_autopop == 0xA968;
         let is_window_refire = trap_no_autopop == 0xA925;
         let is_go_away_refire = trap_no_autopop == 0xA91E;
