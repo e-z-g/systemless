@@ -16823,6 +16823,125 @@ impl super::TrapDispatcher {
                     return_error_and_pop(cpu, argument_bytes, result)
                 }
             }
+            // ImageCompressionDispatch ($AAA3) — Image Compression Manager.
+            //
+            // Selector in the low word of D0; each routine is a Pascal
+            // function, so the caller reserves the result slot, pushes the
+            // arguments, and expects the trap to pop the arguments and
+            // leave the result at SP. Selectors and frames from Universal
+            // Interfaces ImageCompression.h (`TWOWORDINLINE(0x70xx, 0xAAA3)`)
+            // and Inside Macintosh: QuickTime (1993), chapter 3, "Working
+            // With Pictures and Previews" / "Working With File Previews":
+            //
+            //   $2A MakeThumbnailFromPicture(picture, colorDepth,
+            //                                thumbnail, progress): OSErr   14
+            //   $2B MakeThumbnailFromPictureFile(refNum, colorDepth,
+            //                                thumbnail, progress): OSErr   12
+            //   $2C MakeThumbnailFromPixMap(src, srcRect, colorDepth,
+            //                                thumbnail, progress): OSErr   18
+            //   $41 SFGetFilePreview / $42 SFPGetFilePreview /
+            //   $43 StandardGetFilePreview / $44 CustomGetFilePreview —
+            //       the Standard File get routines with a preview pane,
+            //       taking exactly the frames of SFGetFile, SFPGetFile,
+            //       StandardGetFile and CustomGetFile (Pack3 selectors
+            //       $0002, $0004, $0006, $0008).
+            //   $45 MakeFilePreview(resRefNum, progress): OSErr            6
+            //   $46 AddFilePreview(resRefNum, previewType,
+            //                      previewData): OSErr                    10
+            //
+            // HLE behaviour: the thumbnail and file-preview routines pop
+            // their frame and return codecUnimpErr (-8962) — a Finder
+            // preview is cosmetic and nothing reads it back. The get-file
+            // routines are served by the Pack3 implementation: the ICM
+            // form carries its selector in D0 where Pack3 carries a word on
+            // the stack, so the equivalent Pack3 selector is pushed and the
+            // $A9EA arm runs unchanged, including its modal tracking (the
+            // refire check in dispatch.rs admits $AAA3 for that reason).
+            //
+            // Skipping these silently is not neutral. A caller that
+            // restores registers with `movem.l (sp)+` after a fixed-size
+            // cleanup reads them from the unpopped arguments; Cythera's
+            // TGameViewer::MakePreview does exactly that around
+            // MakeThumbnailFromPixMap and returned with A2/A3 holding halves
+            // of its own thumbnail handle, which its caller then passed on
+            // as a file object.
+            //
+            // Regression coverage:
+            //   src/trap/toolbox.rs::tests::image_compression_thumbnail_and_preview_pop_their_pascal_frames
+            //   src/trap/toolbox.rs::tests::image_compression_get_file_preview_delegates_to_pack3
+            (true, 0x2A3) => {
+                const CODEC_UNIMP_ERR: i16 = -8962;
+                let selector = cpu.read_reg(Register::D0) & 0xFFFF;
+                let arg_bytes = match selector {
+                    0x2A => 14,
+                    0x2B => 12,
+                    0x2C => 18,
+                    0x45 => 6,
+                    0x46 => 10,
+                    0x41 | 0x42 | 0x43 | 0x44 => {
+                        if !self.is_standard_file_get_tracking() {
+                            let pack3_selector = match selector {
+                                0x41 => 0x0002u16,
+                                0x42 => 0x0004,
+                                0x43 => 0x0006,
+                                _ => 0x0008,
+                            };
+                            let sp = cpu.read_reg(Register::A7).wrapping_sub(2);
+                            bus.write_word(sp, pack3_selector);
+                            cpu.write_reg(Register::A7, sp);
+                        }
+                        return self.dispatch_toolbox(true, 0x1EA, cpu, bus);
+                    }
+                    _ => return None,
+                };
+                if super::dispatch::trace_quicktime_enabled() {
+                    eprintln!(
+                        "[ICM] selector ${:02X} declined with codecUnimpErr (popping {} bytes)",
+                        selector, arg_bytes
+                    );
+                }
+                let sp = cpu.read_reg(Register::A7).wrapping_add(arg_bytes);
+                bus.write_word(sp, CODEC_UNIMP_ERR as u16);
+                cpu.write_reg(Register::A7, sp);
+                cpu.write_reg(Register::D0, CODEC_UNIMP_ERR as i32 as u32);
+                Ok(())
+            }
+
+            // AppearanceDispatch ($AA74) — Appearance Manager.
+            //
+            // Selector in the low word of D0 (`THREEWORDINLINE(0x303C,
+            // sel, 0xAA74)` in Universal Interfaces Appearance.h). Every
+            // routine returns a four-byte OSStatus in a caller-reserved slot
+            // above its Pascal arguments:
+            //
+            //   $0004 SetThemeWindowBackground(inWindow, inBrush,
+            //                                  inUpdate): OSStatus         8
+            //   $0015 RegisterAppearanceClient(): OSStatus                 0
+            //
+            // Gestalt 'appr' reports the Appearance Manager present, so an
+            // application registers itself and sets theme brushes on its
+            // windows. HLE behaviour: pop the frame and answer noErr; the
+            // system-drawn chrome takes no brush from the application.
+            // Only the selectors observed in use are decoded, because the
+            // frame size is per selector and a wrong pop is worse than the
+            // logged skip.
+            //
+            // Regression coverage:
+            //   src/trap/toolbox.rs::tests::appearance_dispatch_pops_its_frame_and_writes_osstatus
+            (true, 0x274) => {
+                let selector = cpu.read_reg(Register::D0) & 0xFFFF;
+                let arg_bytes = match selector {
+                    0x0004 => 8,
+                    0x0015 => 0,
+                    _ => return None,
+                };
+                let sp = cpu.read_reg(Register::A7).wrapping_add(arg_bytes);
+                bus.write_long(sp, 0);
+                cpu.write_reg(Register::A7, sp);
+                cpu.write_reg(Register::D0, 0);
+                Ok(())
+            }
+
 
             // _TranslationDispatch (0xABFC)
             // Dispatches Translation Manager routines selected by D0.
@@ -27718,6 +27837,80 @@ mod tests {
         assert_eq!(cpu.read_reg(Register::A7), sp);
         assert_eq!(bus.read_word(sp), (-619i16) as u16);
         assert_eq!(disp.guest_calls.critical_depth(), 0);
+    }
+
+    #[test]
+    fn image_compression_thumbnail_and_preview_pop_their_pascal_frames() {
+        // (selector, argument bytes) for MakeThumbnailFromPixMap,
+        // MakeFilePreview and AddFilePreview.
+        for (selector, arg_bytes) in [(0x2Cu32, 18u32), (0x45, 6), (0x46, 10)] {
+            let (mut disp, mut cpu, mut bus) = setup();
+            let base = cpu.read_reg(Register::A7);
+            // Caller reserves the OSErr slot, then pushes the arguments.
+            let slot = base.wrapping_sub(2);
+            bus.write_word(slot, 0x5A5A);
+            let sp = slot.wrapping_sub(arg_bytes);
+            for offset in (0..arg_bytes).step_by(2) {
+                bus.write_word(sp + offset, 0xBEEF);
+            }
+            cpu.write_reg(Register::A7, sp);
+            cpu.write_reg(Register::D0, selector);
+            cpu.write_reg(Register::A2, 0x0011_2233);
+            cpu.write_reg(Register::A3, 0x4455_6677);
+
+            let result = disp.dispatch_toolbox(true, 0x2A3, &mut cpu, &mut bus);
+            assert!(result.is_some(), "ICM selector ${selector:02X} should be handled");
+            assert!(result.unwrap().is_ok());
+            assert_eq!(cpu.read_reg(Register::A7), slot, "selector ${selector:02X} pops its frame");
+            assert_eq!(bus.read_word(slot) as i16, -8962, "codecUnimpErr in the result slot");
+            assert_eq!(cpu.read_reg(Register::D0) as i16, -8962);
+            assert_eq!(cpu.read_reg(Register::A2), 0x0011_2233);
+            assert_eq!(cpu.read_reg(Register::A3), 0x4455_6677);
+        }
+    }
+
+    #[test]
+    fn image_compression_get_file_preview_delegates_to_pack3() {
+        let (mut disp, mut cpu, mut bus) = setup();
+        let base = cpu.read_reg(Register::A7);
+        // StandardGetFilePreview(fileFilter, numTypes, typeList, reply):
+        // 14 argument bytes, no result. Reply is a StandardFileReply whose
+        // first byte is sfGood.
+        let reply = bus.alloc(64);
+        bus.write_byte(reply, 0xFF);
+        let sp = base.wrapping_sub(14);
+        bus.write_long(sp, reply); // VAR reply (last argument, at SP)
+        bus.write_long(sp + 4, 0); // typeList
+        bus.write_word(sp + 8, (-1i16) as u16); // numTypes
+        bus.write_long(sp + 10, 0); // fileFilter
+        cpu.write_reg(Register::A7, sp);
+        cpu.write_reg(Register::D0, 0x43);
+
+        let result = disp.dispatch_toolbox(true, 0x2A3, &mut cpu, &mut bus);
+        assert!(result.is_some(), "StandardGetFilePreview should be handled");
+        assert!(result.unwrap().is_ok());
+        assert_eq!(cpu.read_reg(Register::A7), base, "the 14-byte frame is popped");
+        assert_eq!(bus.read_byte(reply), 0, "headless get-file answers cancel (sfGood false)");
+    }
+
+    #[test]
+    fn appearance_dispatch_pops_its_frame_and_writes_osstatus() {
+        for (selector, arg_bytes) in [(0x0004u32, 8u32), (0x0015, 0)] {
+            let (mut disp, mut cpu, mut bus) = setup();
+            let base = cpu.read_reg(Register::A7);
+            let slot = base.wrapping_sub(4);
+            bus.write_long(slot, 0xDEAD_BEEF);
+            let sp = slot.wrapping_sub(arg_bytes);
+            cpu.write_reg(Register::A7, sp);
+            cpu.write_reg(Register::D0, selector);
+
+            let result = disp.dispatch_toolbox(true, 0x274, &mut cpu, &mut bus);
+            assert!(result.is_some(), "Appearance selector ${selector:04X} should be handled");
+            assert!(result.unwrap().is_ok());
+            assert_eq!(cpu.read_reg(Register::A7), slot, "selector ${selector:04X} pops its frame");
+            assert_eq!(bus.read_long(slot), 0, "noErr OSStatus in the result slot");
+            assert_eq!(cpu.read_reg(Register::D0), 0);
+        }
     }
 
     #[test]
