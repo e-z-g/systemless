@@ -207,19 +207,25 @@ fn guest_scaled_physical_size(
 /// Scheduling on the instruction count rather than wall time is the whole
 /// point: a wall-clock schedule would land differently on a faster build,
 /// which is exactly the comparison these scripts exist to make.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ScriptedInput {
     at: usize,
     action: InputAction,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum InputAction {
     MouseMove { v: i16, h: i16 },
     MouseDown { v: i16, h: i16 },
     MouseUp { v: i16, h: i16 },
     KeyDown { key: u8, ch: u8 },
     KeyUp { key: u8, ch: u8 },
+    /// Write bytes into guest memory at the scheduled instruction count.
+    /// A diagnostics hook for applications that load their own code
+    /// segments, which `SYSTEMLESS_PATCH_BYTES` (applied when HLE `_LoadSeg`
+    /// materialises a segment) cannot reach; scheduling by instruction
+    /// count lets the patch land after the guest's loader has run.
+    Patch { addr: u32, bytes: Vec<u8> },
 }
 
 /// Parse an input script: one `<at> <action> [args]` per line, `#`
@@ -311,6 +317,23 @@ fn parse_input_script(text: &str) -> Result<Vec<ScriptedInput>, String> {
                 let (key, ch) = (num(args[0], line)?, num(args[1], line)?);
                 push(InputAction::KeyDown { key, ch });
                 push(InputAction::KeyUp { key, ch });
+            }
+            "patch" => {
+                expect(2)?;
+                let addr = u32::from_str_radix(
+                    args[0].trim_start_matches("0x").trim_start_matches('$'),
+                    16,
+                )
+                .map_err(|_| format!("line {line}: `patch` wants a hex address"))?;
+                let hex = args[1];
+                if hex.len() % 2 != 0 || hex.is_empty() {
+                    return Err(format!("line {line}: `patch` wants an even-length hex byte string"));
+                }
+                let bytes = (0..hex.len() / 2)
+                    .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16))
+                    .collect::<std::result::Result<Vec<u8>, _>>()
+                    .map_err(|_| format!("line {line}: `patch` bytes are not hex"))?;
+                push(InputAction::Patch { addr, bytes });
             }
             other => return Err(format!("line {line}: unknown action {other:?}")),
         }
@@ -2634,12 +2657,15 @@ fn run_headless(
             if event.at > total {
                 break;
             }
-            match event.action {
+            match event.action.clone() {
                 InputAction::MouseMove { v, h } => runner.set_mouse_position(v, h),
                 InputAction::MouseDown { v, h } => runner.push_mouse_down(v, h),
                 InputAction::MouseUp { v, h } => runner.push_mouse_up(v, h),
                 InputAction::KeyDown { key, ch } => runner.push_key_down(key, ch),
                 InputAction::KeyUp { key, ch } => runner.push_key_up(key, ch),
+                InputAction::Patch { addr, bytes } => {
+                    systemless::memory::MemoryBus::write_bytes(runner.bus_mut(), addr, &bytes);
+                }
             }
             eprintln!("[HEADLESS] input @{}: {:?}", event.at, event.action);
             next_event += 1;
@@ -3144,6 +3170,21 @@ mod tests {
         }
 
         fn stop(&mut self) {}
+    }
+
+    #[test]
+    fn input_script_patch_action_parses_hex_address_and_bytes() {
+        let script = parse_input_script("1200000000 patch 002406F8 605a\n5 patch 0x10 ff\n").unwrap();
+        assert_eq!(script.len(), 2);
+        assert_eq!(script[0].at, 5);
+        assert_eq!(script[0].action, InputAction::Patch { addr: 0x10, bytes: vec![0xff] });
+        assert_eq!(script[1].at, 1_200_000_000);
+        assert_eq!(
+            script[1].action,
+            InputAction::Patch { addr: 0x002406F8, bytes: vec![0x60, 0x5a] }
+        );
+        assert!(parse_input_script("1 patch zz 00\n").is_err());
+        assert!(parse_input_script("1 patch 10 abc\n").is_err());
     }
 
     #[test]
