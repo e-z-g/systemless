@@ -176,6 +176,70 @@ fn trace_pc_range_ticks() -> Option<(Option<u32>, Option<u32>)> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+static TRAP_TAIL_DEPTH: OnceLock<Option<usize>> = OnceLock::new();
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static TRAP_TAIL: std::cell::RefCell<std::collections::VecDeque<(u32, u16, Option<u32>)>> =
+        std::cell::RefCell::new(std::collections::VecDeque::new());
+}
+
+/// Remember the last few trap dispatches so a halt can say what led to it.
+///
+/// A histogram answers "what does this application call"; it cannot answer
+/// "what did it call just before it quit", which is the question a
+/// deterministic halt poses. `SYSTEMLESS_TRACE_TRAP_TAIL=N` keeps the last N
+/// (caller PC, trap word) pairs and prints them when the runner stops.
+#[cfg(not(target_arch = "wasm32"))]
+fn trap_tail_depth() -> Option<usize> {
+    *TRAP_TAIL_DEPTH.get_or_init(|| {
+        std::env::var("SYSTEMLESS_TRACE_TRAP_TAIL")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|depth| *depth > 0)
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn trap_tail_record(pc: u32, opcode: u16, caller: Option<u32>) {
+    let Some(depth) = trap_tail_depth() else {
+        return;
+    };
+    TRAP_TAIL.with(|tail| {
+        let mut tail = tail.borrow_mut();
+        if tail.len() == depth {
+            tail.pop_front();
+        }
+        tail.push_back((pc, opcode, caller));
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn trap_tail_record(_pc: u32, _opcode: u16, _caller: Option<u32>) {}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn trap_tail_print() {
+    if trap_tail_depth().is_none() {
+        return;
+    }
+    TRAP_TAIL.with(|tail| {
+        let tail = tail.borrow();
+        eprintln!("[TRAP-TAIL] last {} trap dispatches, oldest first", tail.len());
+        for (pc, opcode, caller) in tail.iter() {
+            match caller {
+                Some(caller) => eprintln!(
+                    "[TRAP-TAIL] pc=${:08X} trap=${:04X} caller=${:08X}",
+                    pc, opcode, caller
+                ),
+                None => eprintln!("[TRAP-TAIL] pc=${:08X} trap=${:04X}", pc, opcode),
+            }
+        }
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn trap_tail_print() {}
+
 fn trace_pc_range_contains(pc: u32, tick: u32) -> bool {
     #[cfg(target_arch = "wasm32")]
     {
@@ -5801,6 +5865,7 @@ impl FixtureRunner {
                     }
 
                     self.dispatcher.yield_for_ui = yield_for_ui;
+                    trap_tail_record(pc, opcode, self.dispatcher.current_trap_caller);
                     let (event_queue, menu_tracking) =
                         self.process_context.event_queue_and_menu_tracking_mut();
                     let dispatch_result = self.dispatcher.with_process_state(
@@ -6013,6 +6078,7 @@ impl FixtureRunner {
                                 opcode,
                                 caller_str,
                             );
+                            trap_tail_print();
                             self.halted = true;
                             self.halted_pc = Some(pc);
                             self.halted_trap = Some(opcode);
