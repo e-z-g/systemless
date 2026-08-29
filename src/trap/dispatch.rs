@@ -904,7 +904,23 @@ pub(crate) struct LoadSegGetResourceState {
 /// Trap Dispatcher state retained while a handler installed through
 /// `SetTrapAddress` runs. A handler may call the old trap address later, after
 /// changing its stack frame, so old-trap recovery cannot infer this state
-/// from A6 or from the handler's instruction shape.
+/// from A6 or from the handler's instruction shape. Toolbox routines may
+/// alter D0-D2, A0, and A1, but must preserve D3-D7 and A2-A6 (Inside
+/// Macintosh: Operating System Utilities, 1994, pp. 8-15 to 8-16).
+/// A yield handed to the application's own scheduler proc (installed with
+/// `SetThreadScheduler`). The proc runs as guest code; when its `RTD` lands
+/// on the `$FEFD` trampoline the Pack8 dispatch finishes the yield with the
+/// thread it chose.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SchedulerCallState {
+    /// Where the yielding thread resumes if the scheduler keeps it running.
+    pub return_pc: u32,
+    /// The yielding thread's SP after the YieldToThread frame was popped.
+    pub original_sp: u32,
+    /// Address of the four-byte ThreadID result slot the proc writes.
+    pub result_slot: u32,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct NativeTrapCallState {
     pub return_pc: u32,
@@ -1492,6 +1508,11 @@ pub struct TrapDispatcher {
     pub(crate) thread_return_trampoline: u32,
     /// Custom `ThreadSchedulerProcPtr` installed by `SetThreadScheduler`.
     pub(crate) cooperative_thread_scheduler: u32,
+    /// In-flight call to the application's scheduler proc, if any.
+    pub(crate) scheduler_call_state: Option<SchedulerCallState>,
+    /// Lazily allocated `MOVE.W #$FEFD, D0; _Pack8` the scheduler proc
+    /// returns to. `None` until the first scheduled yield.
+    pub(crate) scheduler_trampoline_addr: Option<u32>,
     /// Default cooperative stack size reported by
     /// `GetDefaultThreadStackSize` and used when `NewThread` is passed 0.
     pub(crate) cooperative_thread_stack_size: u32,
@@ -3475,6 +3496,8 @@ impl TrapDispatcher {
             ppc_initialized: false,
             thread_return_trampoline: 0,
             cooperative_thread_scheduler: 0,
+            scheduler_call_state: None,
+            scheduler_trampoline_addr: None,
             cooperative_thread_stack_size: DEFAULT_COOPERATIVE_THREAD_STACK_SIZE,
             cooperative_thread_pool: Vec::new(),
             synthetic_component_instances: HashSet::new(),
