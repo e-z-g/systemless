@@ -1237,6 +1237,101 @@ impl super::TrapDispatcher {
     /// Pick the next ready thread. `suggested_thread` wins when it names a
     /// ready thread, matching `YieldToThread`; otherwise the ready queue
     /// runs round-robin, as the stock 68K scheduler does.
+    /// Selector the scheduler trampoline hands to `_Pack8`.
+    const SCHEDULER_TRAMPOLINE_SELECTOR: u16 = 0xFEFD;
+
+    /// Hand a yield to the application's scheduler proc, if one is
+    /// installed and there is a decision to make.
+    ///
+    /// Inside Macintosh: Thread Manager (1999), pp. 1-79..1-80: the
+    /// Thread Manager calls the custom scheduler "each time it is about to
+    /// schedule a thread", passing a `SchedulerInfoRec` with the current
+    /// and suggested thread IDs; the proc returns the ID of the thread to
+    /// run next, or `kNoThreadID` to accept the default. The proc is
+    ///
+    ///   pascal ThreadID proc(SchedulerInfoRecPtr schedulerInfo);
+    ///
+    /// so the yielding thread's stack gets the record, a four-byte result
+    /// slot, the record's address and a return address into the
+    /// trampoline. `finish_scheduler_call` completes the yield when the
+    /// proc returns. The default path is kept when no scheduler is
+    /// installed, inside a critical section, when nothing else is ready,
+    /// or while a scheduler call is already in flight.
+    ///
+    /// An application that installs a scheduler means it: Cythera's
+    /// TTaskMaster::MyScheduler withholds its animation thread while a
+    /// conversation is up, and round-robin in its place let that thread
+    /// close every conversation on the frame after it opened.
+    fn begin_scheduler_call<C: CpuOps>(
+        &mut self,
+        cpu: &mut C,
+        bus: &mut MacMemoryBus,
+        suggested_thread: u32,
+    ) -> bool {
+        let proc_addr = self.cooperative_thread_scheduler;
+        if proc_addr == 0
+            || self.scheduler_call_state.is_some()
+            || self.thread_critical_nesting != 0
+            || self.cooperative_thread_ready.is_empty()
+        {
+            return false;
+        }
+        let trampoline = match self.scheduler_trampoline_addr {
+            Some(addr) => addr,
+            None => {
+                let addr = bus.alloc(8);
+                bus.write_word(addr, 0x303C); // MOVE.W #imm, D0
+                bus.write_word(addr + 2, Self::SCHEDULER_TRAMPOLINE_SELECTOR);
+                bus.write_word(addr + 4, 0xA816); // _Pack8
+                self.scheduler_trampoline_addr = Some(addr);
+                addr
+            }
+        };
+        let original_sp = cpu.read_reg(Register::A7);
+        let return_pc = cpu.read_reg(Register::PC);
+        // SchedulerInfoRec: InfoRecSize, CurrentThreadID,
+        // SuggestedThreadID, InterruptedCoopThreadID (Threads.h).
+        let info_rec = original_sp.wrapping_sub(16);
+        bus.write_long(info_rec, 16);
+        bus.write_long(info_rec + 4, self.current_cooperative_thread);
+        bus.write_long(info_rec + 8, suggested_thread);
+        bus.write_long(info_rec + 12, 0);
+        let result_slot = info_rec.wrapping_sub(4);
+        bus.write_long(result_slot, 0);
+        let arg = result_slot.wrapping_sub(4);
+        bus.write_long(arg, info_rec);
+        let ret = arg.wrapping_sub(4);
+        bus.write_long(ret, trampoline);
+        cpu.write_reg(Register::A7, ret);
+        cpu.write_reg(Register::PC, proc_addr);
+        self.scheduler_call_state = Some(super::dispatch::SchedulerCallState {
+            return_pc,
+            original_sp,
+            result_slot,
+        });
+        true
+    }
+
+    /// The scheduler proc has returned: apply its choice and resume.
+    fn finish_scheduler_call<C: CpuOps>(&mut self, cpu: &mut C, bus: &mut MacMemoryBus) -> Result<()> {
+        let Some(state) = self.scheduler_call_state.take() else {
+            return Err(Error::Halted);
+        };
+        let chosen = bus.read_long(state.result_slot);
+        cpu.write_reg(Register::A7, state.original_sp);
+        cpu.write_reg(Register::PC, state.return_pc);
+        cpu.write_reg(Register::D0, 0);
+        let current = self.current_cooperative_thread;
+        if chosen == current {
+            return Ok(());
+        }
+        // kNoThreadID (0) accepts the default choice; any other ID is a
+        // suggestion the default scheduler honours when that thread is
+        // ready, and falls back to round-robin otherwise.
+        self.yield_cooperative_thread(cpu, chosen);
+        Ok(())
+    }
+
     fn next_ready_cooperative_thread(&mut self, suggested_thread: u32) -> Option<u32> {
         let current_id = self.current_cooperative_thread;
         if suggested_thread > 1 && suggested_thread != current_id {
@@ -6809,6 +6904,10 @@ impl super::TrapDispatcher {
                 // returns, its `RTD` lands on a tiny `MOVE.W #$FEFE, D0;
                 // _Pack8` stub that re-enters Pack8 with this sentinel.
                 // Resume the original `AEProcessAppleEvent` caller's flow.
+                if selector == Self::SCHEDULER_TRAMPOLINE_SELECTOR {
+                    return Some(self.finish_scheduler_call(cpu, bus));
+                }
+
                 if selector == 0xFEFE {
                     let state = self
                         .ae_call_state
@@ -16502,6 +16601,9 @@ impl super::TrapDispatcher {
                         bus.write_word(sp + 4, 0);
                         cpu.write_reg(Register::A7, sp + 4);
                         cpu.write_reg(Register::D0, 0);
+                        if self.begin_scheduler_call(cpu, bus, suggested_thread) {
+                            return Some(Ok(()));
+                        }
                         self.yield_cooperative_thread(cpu, suggested_thread);
                         return Some(Ok(()));
                     }
@@ -27867,6 +27969,125 @@ mod tests {
         assert_eq!(cpu.read_reg(Register::A7), sp + 28);
         assert_eq!(bus.read_word(sp + 28), 0);
         assert_eq!(bus.read_long(thread_made), 3);
+    }
+
+    /// Create one cooperative thread (ID 3) from the application thread
+    /// (ID 2) and return the application's SP after the NewThread frame.
+    fn make_one_cooperative_thread(
+        disp: &mut TrapDispatcher,
+        cpu: &mut MockCpu,
+        bus: &mut MacMemoryBus,
+        entry: u32,
+    ) -> u32 {
+        let sp = TEST_SP;
+        let thread_made = bus.alloc(4);
+        cpu.write_reg(Register::A7, sp);
+        cpu.write_reg(Register::A5, 0x00AA_5500);
+        bus.write_long(sp, thread_made);
+        bus.write_long(sp + 4, 0);
+        bus.write_long(sp + 8, 0x0000_0008);
+        bus.write_long(sp + 12, 0x0000_1800);
+        bus.write_long(sp + 16, 0x0065_4321);
+        bus.write_long(sp + 20, entry);
+        bus.write_long(sp + 24, 1);
+        bus.write_word(sp + 28, 0xBEEF);
+        cpu.write_reg(Register::D0, 0x0E03);
+        disp.dispatch_toolbox(true, 0x3F2, cpu, bus).unwrap().unwrap();
+        assert_eq!(bus.read_long(thread_made), 3);
+        sp + 28
+    }
+
+    /// Push a YieldToThread(suggested) frame at `sp` and dispatch it.
+    fn dispatch_yield(
+        disp: &mut TrapDispatcher,
+        cpu: &mut MockCpu,
+        bus: &mut MacMemoryBus,
+        sp: u32,
+        suggested: u32,
+    ) {
+        cpu.write_reg(Register::A7, sp);
+        bus.write_long(sp, suggested);
+        bus.write_word(sp + 4, 0xBEEF);
+        cpu.write_reg(Register::D0, 0x0205);
+        disp.dispatch_toolbox(true, 0x3F2, cpu, bus).unwrap().unwrap();
+    }
+
+    // Inside Macintosh: Thread Manager (1999), pp. 1-79..1-80: a custom
+    // scheduler installed with SetThreadScheduler is called with a
+    // SchedulerInfoRec on every yield and returns the thread to run.
+    #[test]
+    fn yield_calls_the_installed_scheduler_and_runs_its_choice() {
+        let (mut disp, mut cpu, mut bus) = setup();
+        let entry = 0x0012_3456;
+        let scheduler = 0x0034_5678;
+        let app_sp = make_one_cooperative_thread(&mut disp, &mut cpu, &mut bus, entry);
+
+        // SetThreadScheduler(scheduler)
+        cpu.write_reg(Register::A7, app_sp - 6);
+        bus.write_long(app_sp - 6, scheduler);
+        bus.write_word(app_sp - 2, 0xBEEF);
+        cpu.write_reg(Register::D0, 0x0209);
+        disp.dispatch_toolbox(true, 0x3F2, &mut cpu, &mut bus).unwrap().unwrap();
+        assert_eq!(disp.cooperative_thread_scheduler, scheduler);
+
+        // The application yields to any thread: the scheduler proc runs
+        // first, with the record and a result slot on the yielder's stack.
+        let app_pc = 0x000F_0000;
+        cpu.write_reg(Register::PC, app_pc);
+        cpu.write_reg(Register::D3, 0xCAFE_BABE);
+        dispatch_yield(&mut disp, &mut cpu, &mut bus, app_sp - 6, 0);
+        assert_eq!(cpu.read_reg(Register::PC), scheduler, "the scheduler proc runs before any switch");
+        let sp = cpu.read_reg(Register::A7);
+        let trampoline = bus.read_long(sp);
+        assert_eq!(bus.read_word(trampoline), 0x303C);
+        assert_eq!(bus.read_word(trampoline + 2), 0xFEFD);
+        assert_eq!(bus.read_word(trampoline + 4), 0xA816);
+        let info_rec = bus.read_long(sp + 4);
+        assert_eq!(bus.read_long(info_rec), 16, "InfoRecSize");
+        assert_eq!(bus.read_long(info_rec + 4), 2, "CurrentThreadID is the application");
+        assert_eq!(bus.read_long(info_rec + 8), 0, "SuggestedThreadID");
+        assert_eq!(bus.read_long(info_rec + 12), 0, "InterruptedCoopThreadID");
+        assert_eq!(cpu.read_reg(Register::D3), 0xCAFE_BABE, "the yielder's registers are untouched");
+
+        // The proc chooses thread 3 and returns through the trampoline:
+        // RTD #4 leaves SP at the result slot.
+        let result_slot = sp + 8;
+        bus.write_long(result_slot, 3);
+        cpu.write_reg(Register::A7, result_slot);
+        cpu.write_reg(Register::D0, 0xFEFD);
+        disp.dispatch_toolbox(true, 0x016, &mut cpu, &mut bus).unwrap().unwrap();
+        assert_eq!(cpu.read_reg(Register::PC), entry, "thread 3 runs");
+        assert_eq!(disp.current_cooperative_thread, 3);
+        assert!(disp.scheduler_call_state.is_none());
+
+        // Thread 3 yields back; the scheduler keeps it running by
+        // returning its own ID, so nothing switches and it resumes after
+        // the yield with SP restored and noErr in D0.
+        let thread_sp = cpu.read_reg(Register::A7) - 6;
+        let thread_pc = 0x0012_3470;
+        cpu.write_reg(Register::PC, thread_pc);
+        dispatch_yield(&mut disp, &mut cpu, &mut bus, thread_sp, 0);
+        assert_eq!(cpu.read_reg(Register::PC), scheduler);
+        let sp = cpu.read_reg(Register::A7);
+        bus.write_long(sp + 8, 3);
+        cpu.write_reg(Register::A7, sp + 8);
+        cpu.write_reg(Register::D0, 0xFEFD);
+        disp.dispatch_toolbox(true, 0x016, &mut cpu, &mut bus).unwrap().unwrap();
+        assert_eq!(cpu.read_reg(Register::PC), thread_pc, "no switch when the scheduler keeps the current thread");
+        assert_eq!(cpu.read_reg(Register::A7), thread_sp + 4, "the YieldToThread frame is popped");
+        assert_eq!(cpu.read_reg(Register::D0), 0);
+        assert_eq!(disp.current_cooperative_thread, 3);
+    }
+
+    #[test]
+    fn yield_without_a_scheduler_keeps_round_robin() {
+        let (mut disp, mut cpu, mut bus) = setup();
+        let entry = 0x0012_3456;
+        let app_sp = make_one_cooperative_thread(&mut disp, &mut cpu, &mut bus, entry);
+        cpu.write_reg(Register::PC, 0x000F_0000);
+        dispatch_yield(&mut disp, &mut cpu, &mut bus, app_sp - 6, 0);
+        assert_eq!(cpu.read_reg(Register::PC), entry);
+        assert!(disp.scheduler_call_state.is_none());
     }
 
     #[test]
