@@ -11416,6 +11416,133 @@ impl super::TrapDispatcher {
                         Ok(())
                     }
 
+                    // LAddColumn (selector 4 / $04)
+                    // Adds columns to the list and returns the number of the
+                    // first one added.
+                    // FUNCTION LAddColumn(count, colNum: INTEGER;
+                    //                     lHandle: ListHandle): INTEGER;
+                    // Inside Macintosh Volume IV, IV-270
+                    // Pascal calling: sel(2) + lHandle(4) + colNum(2) +
+                    // count(2) = 10, result at SP+10.
+                    //
+                    // The column axis of LAddRow, which this mirrors exactly.
+                    // Without it the selector reached the catch-all fallback,
+                    // which pops the frame correctly and does nothing, so a
+                    // list built by adding a column stayed zero columns wide
+                    // and drew nothing at all. Cythera's Inventory pane is
+                    // built that way, and came up an empty white rectangle.
+                    0x04 => {
+                        let list_handle = bus.read_long(sp + 2);
+                        let mut col = bus.read_word(sp + 6) as i16;
+                        let count = bus.read_word(sp + 8) as i16;
+                        let result_addr = sp + 10;
+
+                        let mut result_col = col;
+                        if let Some(state) = self.list_states.get_mut(&list_handle) {
+                            col = col.clamp(state.data_bounds.1, state.data_bounds.3);
+                            result_col = col;
+
+                            if count > 0 {
+                                let mut moved = std::collections::HashMap::new();
+                                for ((cell_row, cell_col), data) in state.cells.drain() {
+                                    let new_col = if cell_col >= col {
+                                        cell_col + count
+                                    } else {
+                                        cell_col
+                                    };
+                                    moved.insert((cell_row, new_col), data);
+                                }
+                                state.cells = moved;
+
+                                let moved_selected: std::collections::BTreeSet<_> = state
+                                    .selected
+                                    .iter()
+                                    .map(|&(cell_row, cell_col)| {
+                                        let new_col = if cell_col >= col {
+                                            cell_col + count
+                                        } else {
+                                            cell_col
+                                        };
+                                        (cell_row, new_col)
+                                    })
+                                    .collect();
+                                state.selected = moved_selected;
+                                state.data_bounds.3 += count;
+                                state.visible = Self::compute_list_visible_rect(
+                                    state.view_rect,
+                                    state.data_bounds,
+                                    state.cell_size,
+                                );
+                                Self::sync_list_state_to_guest(bus, list_handle, state);
+                            }
+                        }
+
+                        bus.write_word(result_addr, result_col as u16);
+                        cpu.write_reg(Register::A7, result_addr);
+                        Ok(())
+                    }
+
+                    // LDelColumn (selector 32 / $20)
+                    // Deletes columns from the list.
+                    // PROCEDURE LDelColumn(count, colNum: INTEGER;
+                    //                      lHandle: ListHandle);
+                    // Inside Macintosh Volume IV, IV-271
+                    // Pascal calling: sel(2) + lHandle(4) + colNum(2) +
+                    // count(2) = 10; no result slot.
+                    0x20 => {
+                        let list_handle = bus.read_long(sp + 2);
+                        let col = bus.read_word(sp + 6) as i16;
+                        let count = bus.read_word(sp + 8) as i16;
+
+                        if let Some(state) = self.list_states.get_mut(&list_handle) {
+                            if count > 0 && col < state.data_bounds.3 {
+                                state.cells.retain(|&(_, cell_col), _| {
+                                    cell_col < col || cell_col >= col + count
+                                });
+                                let moved = state
+                                    .cells
+                                    .drain()
+                                    .map(|((cell_row, cell_col), data)| {
+                                        let new_col = if cell_col >= col + count {
+                                            cell_col - count
+                                        } else {
+                                            cell_col
+                                        };
+                                        ((cell_row, new_col), data)
+                                    })
+                                    .collect();
+                                state.cells = moved;
+                                state.selected = state
+                                    .selected
+                                    .iter()
+                                    .filter_map(|&(cell_row, cell_col)| {
+                                        if cell_col >= col && cell_col < col + count {
+                                            None
+                                        } else {
+                                            let new_col = if cell_col >= col + count {
+                                                cell_col - count
+                                            } else {
+                                                cell_col
+                                            };
+                                            Some((cell_row, new_col))
+                                        }
+                                    })
+                                    .collect();
+                                state.data_bounds.3 =
+                                    (state.data_bounds.3 - count).max(state.data_bounds.1);
+                                state.visible = Self::compute_list_visible_rect(
+                                    state.view_rect,
+                                    state.data_bounds,
+                                    state.cell_size,
+                                );
+                                Self::sync_list_state_to_guest(bus, list_handle, state);
+                            }
+                        }
+
+                        cpu.write_reg(Register::A7, sp + 10);
+                        Ok(())
+                    }
+
                     // LDelRow (selector 36 / $24)
                     // Deletes rows from the list.
                     // PROCEDURE LDelRow(count, rowNum: INTEGER; lHandle: ListHandle);
@@ -25055,6 +25182,71 @@ mod tests {
         let list_ptr = bus.read_long(list_handle);
         let data_bounds_bottom = bus.read_word(list_ptr + 76) as i16;
         assert_eq!(data_bounds_bottom, 3);
+    }
+
+    // Pack0 / List Manager ($A9E7) — LAddColumn $0004 and LDelColumn $0020
+    // IM:IV 1986 p. IV-270 to IV-271: LAddColumn returns the first column
+    // added and increases dataBounds.right; LDelColumn removes columns and
+    // decreases it. Both reached the catch-all fallback before, which pops
+    // the frame and does nothing, so a guest that added a column got a list
+    // that stayed the width it started at.
+    #[test]
+    fn pack0_laddcolumn_and_ldelcolumn_move_databounds_right() {
+        let (mut disp, mut cpu, mut bus) = setup();
+        let sp = TEST_SP;
+        let view_rect_ptr = 0x351000u32;
+        let data_bounds_ptr = 0x351100u32;
+
+        bus.write_word(view_rect_ptr, 0);
+        bus.write_word(view_rect_ptr + 2, 0);
+        bus.write_word(view_rect_ptr + 4, 40);
+        bus.write_word(view_rect_ptr + 6, 80);
+        bus.write_word(data_bounds_ptr, 0);
+        bus.write_word(data_bounds_ptr + 2, 0);
+        bus.write_word(data_bounds_ptr + 4, 2);
+        bus.write_word(data_bounds_ptr + 6, 1);
+
+        bus.write_word(sp, 0x0044); // LNew
+        bus.write_word(sp + 2, 0);
+        bus.write_word(sp + 4, 0);
+        bus.write_word(sp + 6, 0);
+        bus.write_word(sp + 8, 0);
+        bus.write_long(sp + 10, 0x210000);
+        bus.write_word(sp + 14, 0);
+        bus.write_word(sp + 16, 10);
+        bus.write_word(sp + 18, 40);
+        bus.write_long(sp + 20, data_bounds_ptr);
+        bus.write_long(sp + 24, view_rect_ptr);
+        bus.write_long(sp + 28, 0);
+        let create = disp.dispatch_toolbox(true, 0x1E7, &mut cpu, &mut bus);
+        assert!(create.unwrap().is_ok());
+        let list_handle = bus.read_long(sp + 28);
+        let list_ptr = bus.read_long(list_handle);
+        // dataBounds is at +72; right is the fourth word of that Rect.
+        let data_bounds_right = |bus: &MacMemoryBus| bus.read_word(list_ptr + 78) as i16;
+        assert_eq!(data_bounds_right(&bus), 1);
+
+        cpu.write_reg(Register::A7, sp);
+        bus.write_word(sp, 0x0004); // LAddColumn
+        bus.write_long(sp + 2, list_handle);
+        bus.write_word(sp + 6, 1); // colNum
+        bus.write_word(sp + 8, 2); // count
+        bus.write_word(sp + 10, 0xBEEF); // INTEGER result slot
+        let add = disp.dispatch_toolbox(true, 0x1E7, &mut cpu, &mut bus);
+        assert!(add.unwrap().is_ok());
+        assert_eq!(bus.read_word(sp + 10), 1, "returns the first column added");
+        assert_eq!(cpu.read_reg(Register::A7), sp + 10);
+        assert_eq!(data_bounds_right(&bus), 3, "two columns added");
+
+        cpu.write_reg(Register::A7, sp);
+        bus.write_word(sp, 0x0020); // LDelColumn
+        bus.write_long(sp + 2, list_handle);
+        bus.write_word(sp + 6, 1); // colNum
+        bus.write_word(sp + 8, 2); // count
+        let del = disp.dispatch_toolbox(true, 0x1E7, &mut cpu, &mut bus);
+        assert!(del.unwrap().is_ok());
+        assert_eq!(cpu.read_reg(Register::A7), sp + 10, "procedure, no result slot");
+        assert_eq!(data_bounds_right(&bus), 1, "back to the width it started at");
     }
 
     // Pack0 / List Manager ($A9E7) — LFind selector $0034
