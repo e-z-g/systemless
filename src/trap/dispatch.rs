@@ -2812,6 +2812,27 @@ pub struct TrapDispatcher {
     /// The standard pop-up CDEF replaces `contrlMax` with the menu item count,
     /// so the original pixel width must remain in its private state.
     pub(crate) popup_control_title_widths: HashMap<u32, i16>,
+    /// Appearance Manager control-embedding hierarchy: embedded ControlHandle →
+    /// containing ControlHandle. Written by ControlDispatch ($AA73) selector
+    /// $03 EmbedControl, and by control creation once the owning window has a
+    /// root control, because the Appearance Manager embeds every control
+    /// created after CreateRootControl into that root. Read by
+    /// ActivateControl / DeactivateControl, which act on a control and
+    /// everything embedded in it.
+    pub(crate) control_embed_parents: HashMap<u32, u32>,
+    /// Root ControlHandle for each WindowPtr, created by ControlDispatch
+    /// ($AA73) selector $01 CreateRootControl. Revalidated against the
+    /// window's own control list on every read, so a window that was disposed
+    /// and whose address was reused does not inherit a stale root.
+    pub(crate) control_root_handles: HashMap<u32, u32>,
+    /// Tagged per-control data written by SetControlData ($AA73 selector $12)
+    /// and read back by GetControlData ($13), keyed by (ControlHandle, part
+    /// code, four-character tag).
+    pub(crate) control_tagged_data: HashMap<(u32, i16, [u8; 4]), Vec<u8>>,
+    /// True while the retained TrackControl loop was entered through
+    /// ControlDispatch's HandleControlClick rather than through the $A968
+    /// trap, so that `is_tracking_refire` rewinds onto $AA73 instead.
+    pub(crate) control_click_via_dispatch: bool,
     /// The menu ID of the most recently inserted menu (via InsertMenu).
     /// Cleared when a type-0 userItem GetDItem is called immediately after.
     pub(crate) last_inserted_menu_id: Option<i16>,
@@ -4152,6 +4173,10 @@ impl TrapDispatcher {
             textedit_states: HashMap::new(),
             control_proc_ids: HashMap::new(),
             popup_control_title_widths: HashMap::new(),
+            control_embed_parents: HashMap::new(),
+            control_root_handles: HashMap::new(),
+            control_tagged_data: HashMap::new(),
+            control_click_via_dispatch: false,
             last_inserted_menu_id: None,
             pending_dialog_popup_menu: None,
             dialog_item_popup_menus: HashMap::new(),
@@ -4282,7 +4307,15 @@ impl TrapDispatcher {
         // $AAA3 is the Image Compression Manager, whose *GetFilePreview
         // routines are served by the Pack3 get-file tracking loop.
         let is_standard_file_refire = matches!(trap_no_autopop, 0xA9EA | 0xAAA3);
-        let is_control_refire = trap_no_autopop == 0xA968;
+        // $AA73 is ControlDispatch, whose selector $0A HandleControlClick is
+        // TrackControl with a modifiers word — it is served by rewriting the
+        // frame and running the $A968 arm, so its retained tracking loop has
+        // to rewind onto $AA73. The `control_click_via_dispatch` flag keeps
+        // that narrow: without it, a $AA73 call made from inside a control
+        // action procedure — the one place guest code runs while tracking is
+        // live — would be rewound over for ever.
+        let is_control_refire = trap_no_autopop == 0xA968
+            || (trap_no_autopop == 0xAA73 && self.control_click_via_dispatch);
         let is_window_refire = trap_no_autopop == 0xA925;
         let is_go_away_refire = trap_no_autopop == 0xA91E;
         let is_grow_window_refire = trap_no_autopop == 0xA92B;
