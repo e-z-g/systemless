@@ -392,8 +392,18 @@ fn is_user_save_path(path: &str) -> bool {
     }
 
     let lower = normalized.to_ascii_lowercase();
+    // Scratch areas and the resource-fork shadow tree are never user state.
+    //
+    // The Preferences folder is not in this list, deliberately. What an
+    // application keeps there is exactly the state a player expects to
+    // survive quitting: sound and music levels, window placement, and -- for
+    // Cythera -- which player file was last open, which is what its "Onward"
+    // button reopens. Dropping it made the game start every session with no
+    // player selected and Onward dead. Packaged preference files shipped
+    // inside the archive are still not copied out: `sync_save_files_now`
+    // skips any file whose stats still match `archive_vfs_stats`, so only
+    // files the guest actually created or changed are persisted.
     if lower.starts_with("__rsrc__/")
-        || lower.starts_with("system folder/preferences/")
         || lower.starts_with("system folder/temporary items/")
         || lower.starts_with("temporary items/")
         || lower.starts_with("trash/")
@@ -526,9 +536,15 @@ mod tests {
         assert!(is_user_save_path("Games/My Saved Game"));
 
         assert!(!is_user_save_path(""));
-        assert!(!is_user_save_path(
+        // A guest application's preferences ARE user state and must survive:
+        // Cythera records the player file last opened there, and its "Onward"
+        // button reopens it. Packaged preference files are excluded later, by
+        // the archive-stats check in sync_save_files_now, not by this filter.
+        assert!(is_user_save_path(
             "System Folder/Preferences/EV Override License"
         ));
+        assert!(is_user_save_path("System Folder/Preferences/Cythera Preferences"));
+        assert!(!is_user_save_path("System Folder/Temporary Items/scratch"));
         assert!(!is_user_save_path("Temporary Items/scratch"));
         assert!(!is_user_save_path("Trash/Old Pilot"));
         assert!(!is_user_save_path("Desktop DB"));
