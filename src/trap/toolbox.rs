@@ -25367,7 +25367,7 @@ mod tests {
         bus.write_long(menu_handle, menu_ptr);
 
         let out = bus.alloc(4);
-        let mut command_for = |disp: &mut TrapDispatcher,
+        let command_for = |disp: &mut TrapDispatcher,
                                cpu: &mut MockCpu,
                                bus: &mut MacMemoryBus,
                                item: u16| {
