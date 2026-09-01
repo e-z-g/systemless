@@ -489,7 +489,26 @@ fn rasterize_resource_outline_face(font_id: i16, size: i16) -> Option<&'static F
             .into_iter()
             .find(|subtable| subtable.platform_id == ttf_parser::PlatformId::Macintosh)
     });
-    let scaled = font.as_scaled(size as f32);
+    // ab_glyph's PxScale is NOT an em size. `ScaleFont::h_scale_factor` divides
+    // by `Font::height_unscaled()`, which is the face's hhea ascender minus its
+    // descender -- so handing it a point size rasterises at
+    // `size * unitsPerEm / (ascender - descender)` pixels per em.
+    //
+    // QuickDraw's txSize is a point size, and a classic Mac screen is 72 dpi,
+    // so one point is one pixel per em and the two must be reconciled here.
+    // Cythera's Argos A Nouveau has unitsPerEm 4096 with hhea ascender 3006 and
+    // descender -1282, i.e. height_unscaled 4288, so every Argos string was
+    // drawn at 4096/4288 = 95.5% of its requested size. That is not merely
+    // cosmetic: StringWidth, TextWidth and StyledLineBreak all read the same
+    // Glyph.advance, so the game's own centring and line breaking diverged from
+    // a real Mac -- "Not Registered" measured 93 px against the real 96, and a
+    // line of conversation came out ~17 px short, wrapping in the wrong place.
+    //
+    // A face whose ascender-to-descender span happens to equal its em square is
+    // unaffected, which is why this went unnoticed on the other faces.
+    let units_per_em = font.units_per_em()?;
+    let px_scale = size as f32 * font.height_unscaled() / units_per_em;
+    let scaled = font.as_scaled(px_scale);
     let ascent = scaled.ascent().ceil() as i16;
     let descent = (-scaled.descent()).ceil().max(0.0) as i16;
     let leading = scaled.line_gap().round().max(0.0) as i16;
@@ -508,7 +527,7 @@ fn rasterize_resource_outline_face(font_id: i16, size: i16) -> Option<&'static F
             .round()
             .clamp(0.0, u8::MAX as f32) as u8;
         let Some(outlined) =
-            scaled.outline_glyph(glyph_id.with_scale_and_position(size as f32, point(0.0, 0.0)))
+            scaled.outline_glyph(glyph_id.with_scale_and_position(px_scale, point(0.0, 0.0)))
         else {
             return Glyph {
                 width: 0,
