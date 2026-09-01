@@ -25400,13 +25400,6 @@ mod tests {
         );
     }
 
-    // Pack0 / List Manager ($A9E7) — LAddColumn $0004 and LDelColumn $0020
-    // IM:IV 1986 p. IV-270 to IV-271: LAddColumn returns the first column
-    // added and increases dataBounds.right; LDelColumn removes columns and
-    // decreases it. Both reached the catch-all fallback before, which pops
-    // the frame and does nothing, so a guest that added a column got a list
-    // that stayed the width it started at.
-    #[test]
     #[test]
     fn pack0_lrect_reports_cell_rectangles_and_empties_offscreen_cells() {
         // LRect used to fall through to pack0_fallback, which pops the right
@@ -25507,6 +25500,13 @@ mod tests {
         );
     }
 
+    // Pack0 / List Manager ($A9E7) — LAddColumn $0004 and LDelColumn $0020
+    // IM:IV 1986 p. IV-270 to IV-271: LAddColumn returns the first column
+    // added and increases dataBounds.right; LDelColumn removes columns and
+    // decreases it. Both reached the catch-all fallback before, which pops
+    // the frame and does nothing, so a guest that added a column got a list
+    // that stayed the width it started at.
+    #[test]
     fn pack0_laddcolumn_and_ldelcolumn_move_databounds_right() {
         let (mut disp, mut cpu, mut bus) = setup();
         let sp = TEST_SP;
