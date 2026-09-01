@@ -12239,6 +12239,69 @@ impl super::TrapDispatcher {
                         Ok(())
                     }
 
+                    // LRect (selector 76 / $4C)
+                    // Returns the rectangle a cell occupies, in the local
+                    // coordinates of the list's rView.
+                    // PROCEDURE LRect(VAR cellRect: Rect; theCell: Cell;
+                    //                 lHandle: ListHandle);
+                    // Inside Macintosh Volume IV, IV-273
+                    //
+                    // Pascal calling: sel(2) + lHandle(4) + theCell(4) +
+                    // cellRect ptr(4) = 14; no result slot. Arguments are
+                    // pushed left to right, so the LAST parameter sits
+                    // immediately above the selector -- the same layout the
+                    // LDelColumn arm above reads.
+                    //
+                    //   SP+0   selector
+                    //   SP+2   lHandle    ListHandle
+                    //   SP+6   theCell    Cell (v at +6, h at +8; Cell is a
+                    //                     Point, and a Point's v field is at
+                    //                     the LOWER address)
+                    //   SP+10  cellRect   Rect * (VAR)
+                    //
+                    // Until now this reached pack0_fallback, which pops the
+                    // right number of bytes and leaves the caller's cellRect
+                    // untouched -- so every caller read whatever happened to
+                    // be in that stack slot. SYSTEMLESS.md recorded "Cythera
+                    // never calls $4C", but that observation was taken during
+                    // the pre-StyledLineBreak message-log stall, before
+                    // gameplay was reachable. Three of the four call sites in
+                    // the binary are TTextOut::More, TTextOut::InText and
+                    // TListBox::DrawIntoPort, which are all live now.
+                    //
+                    // IM is explicit that a cell outside the visible range
+                    // yields an EMPTY rectangle rather than an extrapolated
+                    // one, which is what list_cell_rect already returns None
+                    // for; it also clamps to rView, so a partially scrolled
+                    // cell is reported at its visible extent.
+                    0x4C => {
+                        let list_handle = bus.read_long(sp + 2);
+                        let cell_v = bus.read_word(sp + 6) as i16;
+                        let cell_h = bus.read_word(sp + 8) as i16;
+                        let cell_rect_ptr = bus.read_long(sp + 10);
+
+                        let rect = self
+                            .list_states
+                            .get(&list_handle)
+                            .and_then(|state| Self::list_cell_rect(state, cell_v, cell_h));
+                        let (top, left, bottom, right) = rect.unwrap_or((0, 0, 0, 0));
+
+                        if cell_rect_ptr != 0 {
+                            bus.write_word(cell_rect_ptr, top as u16);
+                            bus.write_word(cell_rect_ptr + 2, left as u16);
+                            bus.write_word(cell_rect_ptr + 4, bottom as u16);
+                            bus.write_word(cell_rect_ptr + 6, right as u16);
+                        }
+                        if trace_list_manager_enabled() {
+                            eprintln!(
+                                "[LIST] LRect list=${:08X} cell=({},{}) -> ({},{},{},{})",
+                                list_handle, cell_v, cell_h, top, left, bottom, right
+                            );
+                        }
+                        cpu.write_reg(Register::A7, sp + 14);
+                        Ok(())
+                    }
+
                     // LAutoScroll remains accepted for stack discipline.
                     // Inside Macintosh Volume IV, IV-274.
                     0x10 => self.pack0_fallback(cpu, bus, sp, selector),
@@ -25344,6 +25407,106 @@ mod tests {
     // the frame and does nothing, so a guest that added a column got a list
     // that stayed the width it started at.
     #[test]
+    #[test]
+    fn pack0_lrect_reports_cell_rectangles_and_empties_offscreen_cells() {
+        // LRect used to fall through to pack0_fallback, which pops the right
+        // number of bytes and never writes the caller's VAR cellRect -- so the
+        // caller read back whatever was already in that memory. Cythera calls
+        // it from TTextOut::More, TTextOut::InText and TListBox::DrawIntoPort,
+        // all of which are on live gameplay paths.
+        let (mut disp, mut cpu, mut bus) = setup();
+        let sp = TEST_SP;
+        let view_rect_ptr = 0x352000u32;
+        let data_bounds_ptr = 0x352100u32;
+        let cell_rect_ptr = 0x352200u32;
+
+        // rView (0,0,40,80), cells 10 tall and 40 wide -> 4 rows, 2 columns
+        // visible; dataBounds is deliberately taller than the view so there is
+        // a row that exists but is scrolled out.
+        bus.write_word(view_rect_ptr, 0);
+        bus.write_word(view_rect_ptr + 2, 0);
+        bus.write_word(view_rect_ptr + 4, 40);
+        bus.write_word(view_rect_ptr + 6, 80);
+        bus.write_word(data_bounds_ptr, 0);
+        bus.write_word(data_bounds_ptr + 2, 0);
+        bus.write_word(data_bounds_ptr + 4, 9);
+        bus.write_word(data_bounds_ptr + 6, 2);
+
+        bus.write_word(sp, 0x0044); // LNew
+        bus.write_word(sp + 2, 0);
+        bus.write_word(sp + 4, 0);
+        bus.write_word(sp + 6, 0);
+        bus.write_word(sp + 8, 0);
+        bus.write_long(sp + 10, 0x210000);
+        bus.write_word(sp + 14, 0);
+        bus.write_word(sp + 16, 10); // cell height
+        bus.write_word(sp + 18, 40); // cell width
+        bus.write_long(sp + 20, data_bounds_ptr);
+        bus.write_long(sp + 24, view_rect_ptr);
+        bus.write_long(sp + 28, 0);
+        assert!(disp
+            .dispatch_toolbox(true, 0x1E7, &mut cpu, &mut bus)
+            .unwrap()
+            .is_ok());
+        let list_handle = bus.read_long(sp + 28);
+
+        // Cell (1,1): second row, second column.
+        cpu.write_reg(Register::A7, sp);
+        bus.write_word(sp, 0x004C);
+        bus.write_long(sp + 2, list_handle);
+        bus.write_word(sp + 6, 1); // theCell.v
+        bus.write_word(sp + 8, 1); // theCell.h
+        bus.write_long(sp + 10, cell_rect_ptr);
+        for i in 0..4 {
+            bus.write_word(cell_rect_ptr + i * 2, 0xDEAD);
+        }
+        assert!(disp
+            .dispatch_toolbox(true, 0x1E7, &mut cpu, &mut bus)
+            .unwrap()
+            .is_ok());
+        assert_eq!(
+            (
+                bus.read_word(cell_rect_ptr) as i16,
+                bus.read_word(cell_rect_ptr + 2) as i16,
+                bus.read_word(cell_rect_ptr + 4) as i16,
+                bus.read_word(cell_rect_ptr + 6) as i16,
+            ),
+            (10, 40, 20, 80),
+            "row 1 column 1 is one cell down and one cell right of rView's origin"
+        );
+        assert_eq!(
+            cpu.read_reg(Register::A7),
+            sp + 14,
+            "LRect pops sel(2) + lHandle(4) + theCell(4) + cellRect(4)"
+        );
+
+        // A row that exists in dataBounds but is scrolled out of rView must
+        // come back as an EMPTY rectangle, not an extrapolated one.
+        cpu.write_reg(Register::A7, sp);
+        bus.write_word(sp, 0x004C);
+        bus.write_long(sp + 2, list_handle);
+        bus.write_word(sp + 6, 8); // beyond the four visible rows
+        bus.write_word(sp + 8, 0);
+        bus.write_long(sp + 10, cell_rect_ptr);
+        for i in 0..4 {
+            bus.write_word(cell_rect_ptr + i * 2, 0xDEAD);
+        }
+        assert!(disp
+            .dispatch_toolbox(true, 0x1E7, &mut cpu, &mut bus)
+            .unwrap()
+            .is_ok());
+        assert_eq!(
+            (
+                bus.read_word(cell_rect_ptr),
+                bus.read_word(cell_rect_ptr + 2),
+                bus.read_word(cell_rect_ptr + 4),
+                bus.read_word(cell_rect_ptr + 6),
+            ),
+            (0, 0, 0, 0),
+            "a cell outside the visible range yields an empty rect"
+        );
+    }
+
     fn pack0_laddcolumn_and_ldelcolumn_move_databounds_right() {
         let (mut disp, mut cpu, mut bus) = setup();
         let sp = TEST_SP;
