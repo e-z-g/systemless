@@ -1181,10 +1181,27 @@ impl super::TrapDispatcher {
             },
         );
         self.ensure_control_aux_record(bus, handle);
+        // The root control has to be found before the new control joins the
+        // list, or a window whose root registration is stale would adopt the
+        // control being created as its own root.
+        let root = self.window_root_control(bus, window_ptr);
         if window_ptr != 0 {
             let old_head = bus.read_long(window_ptr + 140);
             bus.write_long(ctrl_ptr, old_head);
             bus.write_long(window_ptr + 140, handle);
+        }
+        // Once a window has a root control, the Appearance Manager embeds
+        // every control created in that window into it — that is the whole
+        // reason CreateRootControl answers errControlsAlreadyExist when the
+        // window already holds controls, and why an application calls it
+        // before building its interface. Recording the containment here is
+        // what lets ActivateControl(root) reach the whole window, which is
+        // how an Appearance-era application activates and deactivates its
+        // controls. Controls.h, CreateRootControl / EmbedControl.
+        if let Some(root) = root {
+            if root != handle {
+                self.control_embed_parents.insert(handle, root);
+            }
         }
         (handle, ctrl_ptr)
     }
@@ -1224,6 +1241,7 @@ impl super::TrapDispatcher {
             self.control_manager.remove_pointer(ctrl_ptr);
             bus.free(ctrl_ptr);
         }
+        self.forget_control_dispatch_state(ctrl_handle);
         bus.free(ctrl_handle);
     }
 
@@ -2606,6 +2624,178 @@ impl super::TrapDispatcher {
         bus.read_word(addr) != 0
     }
 
+    /// The root ControlHandle of `window_ptr`, if CreateRootControl made one
+    /// and it is still linked into that window's control list.
+    ///
+    /// The revalidation matters because a WindowPtr is an address: a window
+    /// that is disposed and whose storage is handed back out would otherwise
+    /// inherit the previous window's root, and CreateRootControl would answer
+    /// errRootAlreadyExists for a window that has no controls at all. Walking
+    /// the list is cheap — an Appearance window holds a handful of controls —
+    /// and it makes the map self-healing instead of something CloseWindow has
+    /// to remember to clean up.
+    pub(crate) fn window_root_control(
+        &self,
+        bus: &MacMemoryBus,
+        window_ptr: u32,
+    ) -> Option<u32> {
+        let root = self.control_root_handles.get(&window_ptr).copied()?;
+        if root == 0 || window_ptr == 0 {
+            return None;
+        }
+        let mut ctrl_handle = bus.read_long(window_ptr + 140);
+        let mut guard = 0;
+        while ctrl_handle != 0 && guard < 4096 {
+            if ctrl_handle == root {
+                return Some(root);
+            }
+            let ctrl_ptr = bus.read_long(ctrl_handle);
+            if ctrl_ptr == 0 {
+                break;
+            }
+            ctrl_handle = bus.read_long(ctrl_ptr);
+            guard += 1;
+        }
+        None
+    }
+
+    /// Drop every piece of ControlDispatch side-table state that a
+    /// ControlHandle owns.
+    ///
+    /// Called from both control-disposal paths. A handle is an address and
+    /// the Memory Manager reuses addresses, so a disposed control that left
+    /// an embedding parent, a root registration or a tagged-data entry behind
+    /// would hand all of it to whatever control is allocated there next.
+    pub(crate) fn forget_control_dispatch_state(&mut self, ctrl_handle: u32) {
+        if ctrl_handle == 0 {
+            return;
+        }
+        self.control_embed_parents.remove(&ctrl_handle);
+        self.control_embed_parents
+            .retain(|_, container| *container != ctrl_handle);
+        self.control_root_handles.retain(|_, root| *root != ctrl_handle);
+        self.control_tagged_data
+            .retain(|(handle, _, _), _| *handle != ctrl_handle);
+    }
+
+    /// The topmost visible, active control of `window_ptr` containing the
+    /// local point, with the part code its definition procedure reports.
+    ///
+    /// Shared by FindControl ($A96C) and ControlDispatch's
+    /// FindControlUnderMouse ($AA73 selector $09), which differ only in which
+    /// of the control and the part code is the function result. The two
+    /// disagree on the part code and deliberately so: FindControl's arm has
+    /// answered a fixed inButton (10) since it was written, and changing that
+    /// is a behaviour change for every existing guest, so this helper returns
+    /// the handle and the rectangle hit and each caller decides.
+    fn control_under_point(
+        &self,
+        bus: &MacMemoryBus,
+        window_ptr: u32,
+        pt_v: i16,
+        pt_h: i16,
+    ) -> Option<(u32, u32)> {
+        if window_ptr == 0 {
+            return None;
+        }
+        let mut ctrl_handle = bus.read_long(window_ptr + 140);
+        let mut guard = 0;
+        while ctrl_handle != 0 && guard < 4096 {
+            let ctrl_ptr = bus.read_long(ctrl_handle);
+            if ctrl_ptr == 0 {
+                break;
+            }
+            let vis = bus.read_byte(ctrl_ptr + 16);
+            let hilite = bus.read_byte(ctrl_ptr + 17);
+            if Self::control_vis_is_visible(vis) && hilite != 255 {
+                let r_top = bus.read_word(ctrl_ptr + 8) as i16;
+                let r_left = bus.read_word(ctrl_ptr + 10) as i16;
+                let r_bottom = bus.read_word(ctrl_ptr + 12) as i16;
+                let r_right = bus.read_word(ctrl_ptr + 14) as i16;
+                if pt_v >= r_top && pt_v < r_bottom && pt_h >= r_left && pt_h < r_right {
+                    return Some((ctrl_handle, ctrl_ptr));
+                }
+            }
+            ctrl_handle = bus.read_long(ctrl_ptr);
+            guard += 1;
+        }
+        None
+    }
+
+    /// Every control embedded in `container`, transitively, `container` first.
+    ///
+    /// The visited set is not defensive programming for its own sake: the
+    /// embedding map is written from guest calls, and a guest that embeds A
+    /// into B and B into A would otherwise walk for ever inside a trap.
+    fn embedded_control_family(&self, container: u32) -> Vec<u32> {
+        let mut order = vec![container];
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        seen.insert(container);
+        let mut index = 0;
+        while index < order.len() {
+            let parent = order[index];
+            index += 1;
+            let mut children: Vec<u32> = self
+                .control_embed_parents
+                .iter()
+                .filter(|(child, embedder)| **embedder == parent && !seen.contains(*child))
+                .map(|(child, _)| *child)
+                .collect();
+            // HashMap iteration order is unspecified; sort so that the draw
+            // order a test observes is the same on every run.
+            children.sort_unstable();
+            for child in children {
+                seen.insert(child);
+                order.push(child);
+            }
+        }
+        order
+    }
+
+    /// Set `contrlHilite` on a control and everything embedded in it, and
+    /// redraw whatever actually changed.
+    ///
+    /// This is what ActivateControl and DeactivateControl do: Controls.h
+    /// declares them as `OSErr ActivateControl(ControlRef)` and the
+    /// Appearance Manager applies the change through the embedding
+    /// hierarchy, so deactivating a group box greys the controls inside it.
+    /// The hilite values are the Control Manager's own — 0 is active and 255
+    /// is kControlInactivePart (Controls.h, "Basic part codes"), the same
+    /// pair HiliteControl takes.
+    ///
+    /// Application definition procedures are collected into one call chain
+    /// rather than armed one at a time: arming redirects the CPU into guest
+    /// code, so a second arm in the same trap would discard the first.
+    fn set_control_family_activation<C: CpuOps>(
+        &mut self,
+        cpu: &mut C,
+        bus: &mut MacMemoryBus,
+        container: u32,
+        active: bool,
+    ) {
+        let target_hilite: u8 = if active { 0 } else { 255 };
+        let mut plain_redraws = Vec::new();
+        let mut cdef_calls = Vec::new();
+        for ctrl_handle in self.embedded_control_family(container) {
+            let ctrl_ptr = Self::control_record_ptr(bus, ctrl_handle);
+            if ctrl_ptr == 0 || bus.read_byte(ctrl_ptr + 17) == target_hilite {
+                continue;
+            }
+            bus.write_byte(ctrl_ptr + 17, target_hilite);
+            if self.control_uses_application_def_proc(bus, ctrl_ptr) {
+                cdef_calls.push((ctrl_handle, Self::CDEF_DRAW_CNTL_MSG, 0u32, None));
+            } else {
+                plain_redraws.push(ctrl_ptr);
+            }
+        }
+        for ctrl_ptr in plain_redraws {
+            self.draw_control(cpu, bus, ctrl_ptr);
+        }
+        if !cdef_calls.is_empty() {
+            self.arm_control_def_call_chain(cpu, bus, &cdef_calls);
+        }
+    }
+
     pub(crate) fn dispatch_control<C: CpuOps>(
         &mut self,
         is_tool: bool,
@@ -2700,18 +2890,24 @@ impl super::TrapDispatcher {
                     while ctrl_handle != 0 {
                         let ctrl_ptr = bus.read_long(ctrl_handle);
                         if ctrl_ptr == 0 {
+                            self.forget_control_dispatch_state(ctrl_handle);
                             bus.free(ctrl_handle);
                             break;
                         }
                         let next = bus.read_long(ctrl_ptr);
                         self.release_control_aux_record(bus, ctrl_handle);
                         self.control_manager.remove_pointer(ctrl_ptr);
+                        self.forget_control_dispatch_state(ctrl_handle);
                         bus.free(ctrl_ptr);
                         bus.free(ctrl_handle);
                         ctrl_handle = next;
                     }
                     // Nil out the window's control list head
                     bus.write_long(window_ptr + 140, 0);
+                    // KillControls takes the root control with everything
+                    // else, so the window has no root afterwards and
+                    // CreateRootControl may legitimately be called again.
+                    self.control_root_handles.remove(&window_ptr);
                 }
                 Ok(())
             }
@@ -3899,47 +4095,20 @@ impl super::TrapDispatcher {
                 let pt_v = bus.read_word(sp + 8) as i16;
                 let pt_h = bus.read_word(sp + 10) as i16;
 
-                let mut found_handle: u32 = 0;
-                let mut found_part: u16 = 0;
-
                 // Walk the control list starting at window+140 (wControlList)
-                // Macintosh TB Essentials 1992, 4-67
-                if window_ptr != 0 {
-                    let mut ctrl_handle = bus.read_long(window_ptr + 140);
-                    while ctrl_handle != 0 {
-                        let ctrl_ptr = bus.read_long(ctrl_handle);
-                        if ctrl_ptr == 0 {
-                            break;
-                        }
-
-                        // Check visibility (offset 16; zero is invisible)
-                        let vis = bus.read_byte(ctrl_ptr + 16);
-                        // Check hilite (offset 17, 255 = inactive/disabled)
-                        let hilite = bus.read_byte(ctrl_ptr + 17);
-
-                        if Self::control_vis_is_visible(vis) && hilite != 255 {
-                            // Check contrlRect (offset 8): top, left, bottom, right
-                            let r_top = bus.read_word(ctrl_ptr + 8) as i16;
-                            let r_left = bus.read_word(ctrl_ptr + 10) as i16;
-                            let r_bottom = bus.read_word(ctrl_ptr + 12) as i16;
-                            let r_right = bus.read_word(ctrl_ptr + 14) as i16;
-
-                            if pt_v >= r_top && pt_v < r_bottom && pt_h >= r_left && pt_h < r_right
-                            {
-                                found_handle = ctrl_handle;
-                                // Return part code 10 (kControlButtonPart) for
-                                // simple button controls. The proper approach
-                                // would call the CDEF's testCntl, but for HLE
-                                // we return a generic hit indicator.
-                                found_part = 10;
-                                break;
-                            }
-                        }
-
-                        // Follow the linked list: nextControl at offset 0
-                        ctrl_handle = bus.read_long(ctrl_ptr);
-                    }
-                }
+                // Macintosh TB Essentials 1992, 4-67. The walk itself lives in
+                // control_under_point, which ControlDispatch's
+                // FindControlUnderMouse shares.
+                let (found_handle, found_part) = match self
+                    .control_under_point(bus, window_ptr, pt_v, pt_h)
+                {
+                    // Return part code 10 (kControlButtonPart) for
+                    // simple button controls. The proper approach
+                    // would call the CDEF's testCntl, but for HLE
+                    // we return a generic hit indicator.
+                    Some((ctrl_handle, _)) => (ctrl_handle, 10u16),
+                    None => (0u32, 0u16),
+                };
 
                 if which_ctrl_ptr != 0 {
                     bus.write_long(which_ctrl_ptr, found_handle);
@@ -4271,6 +4440,490 @@ impl super::TrapDispatcher {
                 cpu.write_reg(Register::A7, sp + 4);
                 bus.write_word(sp + 4, variant as u16);
                 Ok(())
+            }
+
+            // ControlDispatch ($AA73) — the Appearance Manager's Control
+            // Manager extensions.
+            //
+            // Selector in the low word of D0, pushed by MPW's inline glue as
+            // `THREEWORDINLINE(0x303C, sel, 0xAA73)` (Universal Interfaces
+            // Controls.h). Unlike MenuDispatch, the selector carries no
+            // argument-word count in its high byte, so every frame below was
+            // read off the prototypes in Controls.h and confirmed against the
+            // pushes at a real call site. The prototypes:
+            //
+            //   $01 CreateRootControl(inWindow, VAR outControl): OSErr      8
+            //   $03 EmbedControl(inControl, inContainer): OSErr             8
+            //   $07 ActivateControl(inControl): OSErr                       4
+            //   $08 DeactivateControl(inControl): OSErr                     4
+            //   $09 FindControlUnderMouse(inWhere, inWindow,
+            //                             VAR outPart): ControlHandle      12
+            //   $0A HandleControlClick(inControl, inWhere, inModifiers,
+            //                          inAction): ControlPartCode          14
+            //   $0B HandleControlKey(inControl, inKeyCode, inCharCode,
+            //                        inModifiers): ControlPartCode         10
+            //   $0C IdleControls(inWindow)                                  4
+            //   $0D GetKeyboardFocus(inWindow, VAR outControl): OSErr       8
+            //   $12 SetControlData(inControl, inPart, inTagName,
+            //                      inSize, inData): OSErr                  18
+            //   $13 GetControlData(inControl, inPart, inTagName,
+            //                      inBufferSize, outBuffer,
+            //                      VAR outActualSize): OSErr               22
+            //
+            // Systemless answers Gestalt 'appr' with the Appearance Manager
+            // present, so an application of that era builds its interface out
+            // of these rather than out of NewControl and TrackControl alone,
+            // and an unimplemented trap now halts the run rather than being
+            // skipped. Two of them cannot be made safe by popping alone:
+            // CreateRootControl and FindControlUnderMouse both hand back a
+            // ControlHandle in a slot the caller reserved and then use it
+            // without checking the OSErr, so a trap that pops without writing
+            // leaves the caller holding stack garbage as a control.
+            //
+            // What is modelled and what is not:
+            //
+            //  * The embedding hierarchy is real — CreateRootControl makes an
+            //    invisible root user pane, controls created afterwards are
+            //    embedded in it, and Activate/DeactivateControl walk it. That
+            //    is what makes ActivateControl(root) reach a whole window.
+            //  * Keyboard focus is not modelled at all, and GetKeyboardFocus
+            //    answers noErr with a nil control for that reason: nothing can
+            //    have set a focus, so "no control has the focus" is the true
+            //    answer rather than a placeholder. HandleControlKey therefore
+            //    answers kControlNoPart.
+            //  * Get/SetControlData round-trip kControlFontStyleTag and refuse
+            //    every other tag with errDataNotSupported rather than guessing
+            //    a layout. The stored ControlFontStyleRec is NOT yet consulted
+            //    when the control is drawn, so setting a control's font and
+            //    justification is remembered but not honoured.
+            //
+            // Selectors that are not decoded fall through to the unimplemented
+            // path, because a frame popped by the wrong number of bytes is
+            // worse than a halt that names the selector.
+            //
+            // Regression coverage:
+            //   src/trap/control.rs::tests::control_dispatch_*
+            (true, 0x273) => {
+                // Control Manager error codes, MacErrors.h.
+                const ERR_DATA_NOT_SUPPORTED: i16 = -30581;
+                const ERR_ROOT_ALREADY_EXISTS: i16 = -30587;
+                const ERR_DATA_SIZE_MISMATCH: i16 = -30591;
+                const ERR_CANT_EMBED_INTO_SELF: i16 = -30594;
+                const ERR_CANT_EMBED_ROOT: i16 = -30595;
+                const CONTROL_HANDLE_INVALID_ERR: i16 = -30599;
+                // kControlUserPaneProc, ControlDefinitions.h. The root control
+                // is an embedding container that draws nothing of its own,
+                // which is exactly a user pane; it is created invisible so
+                // that DrawControls, FindControl and TestControl all skip it
+                // without needing to know it is special.
+                const CONTROL_USER_PANE_PROC: i16 = 256;
+                // kControlFontStyleTag, Controls.h; the ControlFontStyleRec it
+                // names is flags/font/size/style/mode/just plus two RGBColors.
+                const CONTROL_FONT_STYLE_TAG: [u8; 4] = *b"font";
+                const CONTROL_FONT_STYLE_SIZE: i32 = 24;
+
+                let selector = cpu.read_reg(Register::D0) & 0xFFFF;
+                let sp = cpu.read_reg(Register::A7);
+                match selector {
+                    // CreateRootControl(inWindow: WindowPtr;
+                    //     VAR outControl: ControlHandle): OSErr
+                    //   SP+0  outControl (VAR, 4)
+                    //   SP+4  inWindow            (4)
+                    //   SP+8  result OSErr        (2)
+                    //
+                    // The root is given the window's portRect so that anything
+                    // later taught to clip to a container has the right
+                    // rectangle, and contrlVis 0 so that nothing draws or
+                    // hit-tests it in the meantime.
+                    //
+                    // On errRootAlreadyExists the existing root is still
+                    // written to outControl. That is deliberate: a caller that
+                    // ignores the OSErr — and the observed one does, it reads
+                    // its local straight back into a register — otherwise
+                    // stores whatever was in that stack slot as a control.
+                    0x0001 => {
+                        let out_control = bus.read_long(sp);
+                        let window_ptr = bus.read_long(sp + 4);
+                        let (root, err) = if window_ptr == 0 {
+                            // Controls.h documents no error for a nil window.
+                            // paramErr is the Toolbox's general "that argument
+                            // is not usable" and leaves outControl nil.
+                            (0u32, -50i16)
+                        } else if let Some(existing) = self.window_root_control(bus, window_ptr) {
+                            (existing, ERR_ROOT_ALREADY_EXISTS)
+                        } else {
+                            let bounds = (
+                                bus.read_word(window_ptr + 16) as i16,
+                                bus.read_word(window_ptr + 18) as i16,
+                                bus.read_word(window_ptr + 20) as i16,
+                                bus.read_word(window_ptr + 22) as i16,
+                            );
+                            let (handle, _) = self.create_control_record(
+                                bus,
+                                window_ptr,
+                                bounds,
+                                &[],
+                                false,
+                                0,
+                                0,
+                                1,
+                                CONTROL_USER_PANE_PROC,
+                                0,
+                            );
+                            if handle != 0 {
+                                self.control_root_handles.insert(window_ptr, handle);
+                            }
+                            (handle, 0)
+                        };
+                        if out_control != 0 {
+                            bus.write_long(out_control, root);
+                        }
+                        if trace_controls_enabled() {
+                            eprintln!(
+                                "[CONTROL] CreateRootControl window=${window_ptr:08X} \
+                                 root=${root:08X} err={err}"
+                            );
+                        }
+                        bus.write_word(sp + 8, err as u16);
+                        cpu.write_reg(Register::A7, sp + 8);
+                        Ok(())
+                    }
+
+                    // EmbedControl(inControl, inContainer: ControlHandle): OSErr
+                    //   SP+0  inContainer (4)
+                    //   SP+4  inControl   (4)
+                    //   SP+8  result OSErr (2)
+                    //
+                    // A container that does not actually support embedding
+                    // should be refused with errControlIsNotEmbedder, but that
+                    // needs a per-definition feature table Systemless does not
+                    // have, and inventing one would refuse containers that
+                    // work on a real Mac. Only the two structural errors are
+                    // enforced.
+                    0x0003 => {
+                        let container = bus.read_long(sp);
+                        let control = bus.read_long(sp + 4);
+                        let control_ptr = Self::control_record_ptr(bus, control);
+                        let container_ptr = Self::control_record_ptr(bus, container);
+                        let control_is_root = control_ptr != 0
+                            && self.window_root_control(bus, bus.read_long(control_ptr + 4))
+                                == Some(control);
+                        let err = if control_ptr == 0 || container_ptr == 0 {
+                            CONTROL_HANDLE_INVALID_ERR
+                        } else if control == container {
+                            ERR_CANT_EMBED_INTO_SELF
+                        } else if control_is_root {
+                            ERR_CANT_EMBED_ROOT
+                        } else {
+                            self.control_embed_parents.insert(control, container);
+                            0
+                        };
+                        if trace_controls_enabled() {
+                            eprintln!(
+                                "[CONTROL] EmbedControl control=${control:08X} \
+                                 container=${container:08X} err={err}"
+                            );
+                        }
+                        bus.write_word(sp + 8, err as u16);
+                        cpu.write_reg(Register::A7, sp + 8);
+                        Ok(())
+                    }
+
+                    // ActivateControl / DeactivateControl(inControl): OSErr
+                    //   SP+0  inControl   (4)
+                    //   SP+4  result OSErr (2)
+                    //
+                    // A7 and the result are finalised before the redraw,
+                    // because activating a control with an application
+                    // definition procedure redirects the CPU into guest code
+                    // and must be the last thing this arm does.
+                    0x0007 | 0x0008 => {
+                        let ctrl_handle = bus.read_long(sp);
+                        let active = selector == 0x0007;
+                        let err = if Self::control_record_ptr(bus, ctrl_handle) == 0 {
+                            CONTROL_HANDLE_INVALID_ERR
+                        } else {
+                            0
+                        };
+                        if trace_controls_enabled() {
+                            eprintln!(
+                                "[CONTROL] {}Control control=${ctrl_handle:08X} err={err}",
+                                if active { "Activate" } else { "Deactivate" }
+                            );
+                        }
+                        bus.write_word(sp + 4, err as u16);
+                        cpu.write_reg(Register::A7, sp + 4);
+                        if err == 0 {
+                            self.set_control_family_activation(cpu, bus, ctrl_handle, active);
+                        }
+                        Ok(())
+                    }
+
+                    // FindControlUnderMouse(inWhere: Point; inWindow: WindowPtr;
+                    //     VAR outPart: SInt16): ControlHandle
+                    //   SP+0   outPart (VAR, 4)
+                    //   SP+4   inWindow      (4)
+                    //   SP+8   inWhere Point (4)
+                    //   SP+12  result ControlHandle (4)
+                    //
+                    // Unlike FindControl this is a function returning the
+                    // control, with the part code in the VAR parameter. The
+                    // part code comes from the same routine TestControl uses,
+                    // so a checkbox reports inCheckBox rather than the fixed
+                    // inButton FindControl still answers.
+                    //
+                    // Technical Note 2053 records that accepting a nil
+                    // outPart came later than the Appearance Manager this
+                    // models, but a nil pointer is checked anyway rather than
+                    // writing through it.
+                    0x0009 => {
+                        let out_part = bus.read_long(sp);
+                        let window_ptr = bus.read_long(sp + 4);
+                        let pt_v = bus.read_word(sp + 8) as i16;
+                        let pt_h = bus.read_word(sp + 10) as i16;
+                        let (handle, part) =
+                            match self.control_under_point(bus, window_ptr, pt_v, pt_h) {
+                                Some((ctrl_handle, ctrl_ptr)) => {
+                                    let part = match self.control_manager.proc_id(ctrl_ptr) {
+                                        16 => self.standard_scrollbar_testcontrol_part_code(
+                                            bus, ctrl_ptr, pt_v, pt_h,
+                                        ),
+                                        _ => self.standard_testcontrol_part_code(ctrl_ptr),
+                                    };
+                                    (ctrl_handle, part)
+                                }
+                                None => (0u32, 0u16),
+                            };
+                        if out_part != 0 {
+                            bus.write_word(out_part, part);
+                        }
+                        if trace_controls_enabled() {
+                            eprintln!(
+                                "[CONTROL] FindControlUnderMouse window=${window_ptr:08X} \
+                                 pt=({pt_v},{pt_h}) -> control=${handle:08X} part={part}"
+                            );
+                        }
+                        bus.write_long(sp + 12, handle);
+                        cpu.write_reg(Register::A7, sp + 12);
+                        Ok(())
+                    }
+
+                    // HandleControlClick(inControl: ControlHandle;
+                    //     inWhere: Point; inModifiers: EventModifiers;
+                    //     inAction: ControlActionUPP): ControlPartCode
+                    //   SP+0   inAction     (4)
+                    //   SP+4   inModifiers  (2)
+                    //   SP+6   inWhere      (4)
+                    //   SP+10  inControl    (4)
+                    //   SP+14  result       (2)
+                    //
+                    // This is TrackControl plus a modifiers word — Controls.h
+                    // says so outright: "HandleControlClick is preferable to
+                    // TrackControl when running under Appearance 1.0 as you
+                    // can pass in modifiers, which some of the new controls
+                    // use". Systemless models no control that reads the
+                    // modifiers, so the frame is rewritten into TrackControl's
+                    // and the $A968 arm runs unchanged, keeping one tracking
+                    // loop rather than two.
+                    //
+                    // The rewrite is exact rather than approximate. Moving
+                    // A7 up by two makes inWhere, inControl and the result
+                    // slot land on TrackControl's actionProc+4, +8 and +12,
+                    // so only inAction has to be copied, and TrackControl's
+                    // own pop to sp+12 lands on SP+14 — where the caller's
+                    // `move.w (a7)+,d0` expects the part code.
+                    //
+                    // TrackControl does not return until mouse-up: it retains
+                    // its state and the runner rewinds the PC onto the trap.
+                    // On such a refire A7 is already the rewritten frame, so
+                    // the rewrite is skipped — the same shape the Image
+                    // Compression Manager's *GetFilePreview selectors use for
+                    // the Standard File loop.
+                    0x000A => {
+                        if !self.is_control_tracking() {
+                            let action_proc = bus.read_long(sp);
+                            bus.write_long(sp + 2, action_proc);
+                            cpu.write_reg(Register::A7, sp + 2);
+                        }
+                        self.control_click_via_dispatch = true;
+                        let result = self.dispatch_control(true, 0x168, cpu, bus);
+                        if !self.is_control_tracking() {
+                            self.control_click_via_dispatch = false;
+                        }
+                        return result;
+                    }
+
+                    // HandleControlKey(inControl: ControlHandle;
+                    //     inKeyCode, inCharCode: SInt16;
+                    //     inModifiers: EventModifiers): ControlPartCode
+                    //   SP+0   inModifiers (2)
+                    //   SP+2   inCharCode  (2)
+                    //   SP+4   inKeyCode   (2)
+                    //   SP+6   inControl   (4)
+                    //   SP+10  result      (2)
+                    //
+                    // The Appearance Manager sends the key to the control's
+                    // definition procedure as kControlMsgKeyDown, which is one
+                    // of the messages only an Appearance-era CDEF understands.
+                    // Systemless draws the standard controls itself and its
+                    // definition-procedure bridge speaks the classic message
+                    // set, so sending that message would mean sending a
+                    // message the receiver cannot answer. None of the standard
+                    // controls takes the keyboard focus in any case, so
+                    // kControlNoPart is the answer a real one gives.
+                    0x000B => {
+                        let modifiers = bus.read_word(sp) as i16;
+                        let char_code = bus.read_word(sp + 2) as i16;
+                        let key_code = bus.read_word(sp + 4) as i16;
+                        let ctrl_handle = bus.read_long(sp + 6);
+                        if trace_controls_enabled() {
+                            eprintln!(
+                                "[CONTROL] HandleControlKey control=${ctrl_handle:08X} \
+                                 key={key_code} char={char_code} modifiers=${modifiers:04X} \
+                                 -> kControlNoPart"
+                            );
+                        }
+                        bus.write_word(sp + 10, 0);
+                        cpu.write_reg(Register::A7, sp + 10);
+                        Ok(())
+                    }
+
+                    // IdleControls(inWindow: WindowPtr)
+                    //   SP+0  inWindow (4), no result — this one is a
+                    //   PROCEDURE, so the caller reserves nothing.
+                    //
+                    // IdleControls gives time to controls that asked for it
+                    // with kControlWantsIdle; the only stock control that does
+                    // is edit text, for its caret blink. Systemless models no
+                    // such control, so there is nothing to give time to. An
+                    // application calls this once per event loop, which is why
+                    // it is silent rather than traced.
+                    0x000C => {
+                        cpu.write_reg(Register::A7, sp + 4);
+                        Ok(())
+                    }
+
+                    // GetKeyboardFocus(inWindow: WindowPtr;
+                    //     VAR outControl: ControlHandle): OSErr
+                    //   SP+0  outControl (VAR, 4)
+                    //   SP+4  inWindow         (4)
+                    //   SP+8  result OSErr     (2)
+                    //
+                    // Systemless implements no keyboard focus, and this is the
+                    // honest consequence rather than a stub: SetKeyboardFocus
+                    // does not exist either, so no control has ever been given
+                    // the focus and nil is the correct answer. noErr with a
+                    // nil control is what a real window with nothing focused
+                    // returns. An application typically calls this and then
+                    // hands the result to HandleControlKey, which tolerates a
+                    // nil control.
+                    0x000D => {
+                        let out_control = bus.read_long(sp);
+                        if out_control != 0 {
+                            bus.write_long(out_control, 0);
+                        }
+                        bus.write_word(sp + 8, 0);
+                        cpu.write_reg(Register::A7, sp + 8);
+                        Ok(())
+                    }
+
+                    // SetControlData(inControl: ControlHandle;
+                    //     inPart: ControlPartCode; inTagName: ResType;
+                    //     inSize: Size; inData: Ptr): OSErr
+                    //   SP+0   inData    (4)
+                    //   SP+4   inSize    (4)
+                    //   SP+8   inTagName (4)
+                    //   SP+12  inPart    (2)
+                    //   SP+14  inControl (4)
+                    //   SP+18  result OSErr (2)
+                    0x0012 => {
+                        let in_data = bus.read_long(sp);
+                        let in_size = bus.read_long(sp + 4) as i32;
+                        let tag = bus.read_long(sp + 8).to_be_bytes();
+                        let part = bus.read_word(sp + 12) as i16;
+                        let ctrl_handle = bus.read_long(sp + 14);
+                        let err = if Self::control_record_ptr(bus, ctrl_handle) == 0 {
+                            CONTROL_HANDLE_INVALID_ERR
+                        } else if tag != CONTROL_FONT_STYLE_TAG {
+                            // Refusing an unknown tag is the documented answer
+                            // and it is also the safe one: storing bytes whose
+                            // layout is unknown would let a later reader hand
+                            // them back as a record it has no right to.
+                            ERR_DATA_NOT_SUPPORTED
+                        } else if in_size != CONTROL_FONT_STYLE_SIZE {
+                            ERR_DATA_SIZE_MISMATCH
+                        } else if in_data == 0 {
+                            -50 // paramErr
+                        } else {
+                            let mut bytes = vec![0u8; CONTROL_FONT_STYLE_SIZE as usize];
+                            for (index, byte) in bytes.iter_mut().enumerate() {
+                                *byte = bus.read_byte(in_data + index as u32);
+                            }
+                            self.control_tagged_data
+                                .insert((ctrl_handle, part, tag), bytes);
+                            0
+                        };
+                        bus.write_word(sp + 18, err as u16);
+                        cpu.write_reg(Register::A7, sp + 18);
+                        Ok(())
+                    }
+
+                    // GetControlData(inControl: ControlHandle;
+                    //     inPart: ControlPartCode; inTagName: ResType;
+                    //     inBufferSize: Size; outBuffer: Ptr;
+                    //     VAR outActualSize: Size): OSErr
+                    //   SP+0   outActualSize (VAR, 4)
+                    //   SP+4   outBuffer     (4)
+                    //   SP+8   inBufferSize  (4)
+                    //   SP+12  inTagName     (4)
+                    //   SP+16  inPart        (2)
+                    //   SP+18  inControl     (4)
+                    //   SP+22  result OSErr  (2)
+                    //
+                    // A control that has never been given a font style still
+                    // has one, and it is all zeroes: ControlFontStyleRec.flags
+                    // is a mask of which fields to use, so zero means "use the
+                    // window's font", which is what a freshly created control
+                    // does. Answering that rather than errDataNotSupported
+                    // matters because the read-modify-write idiom — get the
+                    // style, set one field, put it back — otherwise writes
+                    // back a record built on an untouched buffer.
+                    0x0013 => {
+                        let out_actual_size = bus.read_long(sp);
+                        let out_buffer = bus.read_long(sp + 4);
+                        let buffer_size = bus.read_long(sp + 8) as i32;
+                        let tag = bus.read_long(sp + 12).to_be_bytes();
+                        let part = bus.read_word(sp + 16) as i16;
+                        let ctrl_handle = bus.read_long(sp + 18);
+                        let err = if Self::control_record_ptr(bus, ctrl_handle) == 0 {
+                            CONTROL_HANDLE_INVALID_ERR
+                        } else if tag != CONTROL_FONT_STYLE_TAG {
+                            ERR_DATA_NOT_SUPPORTED
+                        } else if buffer_size < CONTROL_FONT_STYLE_SIZE {
+                            ERR_DATA_SIZE_MISMATCH
+                        } else {
+                            let stored = self
+                                .control_tagged_data
+                                .get(&(ctrl_handle, part, tag))
+                                .cloned()
+                                .unwrap_or_else(|| vec![0u8; CONTROL_FONT_STYLE_SIZE as usize]);
+                            if out_buffer != 0 {
+                                for (index, byte) in stored.iter().enumerate() {
+                                    bus.write_byte(out_buffer + index as u32, *byte);
+                                }
+                            }
+                            if out_actual_size != 0 {
+                                bus.write_long(out_actual_size, CONTROL_FONT_STYLE_SIZE as u32);
+                            }
+                            0
+                        };
+                        bus.write_word(sp + 22, err as u16);
+                        cpu.write_reg(Register::A7, sp + 22);
+                        Ok(())
+                    }
+
+                    _ => return None,
+                }
             }
 
             _ => return None,
@@ -8340,5 +8993,530 @@ mod tests {
             0xBABE,
             "trap must not write past the 2-byte INTEGER result slot"
         );
+    }
+
+    // ControlDispatch ($AA73) — the Appearance Manager's Control Manager
+    // extensions. Every one of these asserts the resulting A7 as well as the
+    // behaviour: the frame is per selector, the selector word carries no
+    // argument count of its own (unlike MenuDispatch), and a Pascal frame
+    // popped by the wrong number of bytes is the failure this project has
+    // paid for most often — the caller's `movem.l (sp)+` then restores
+    // registers out of arguments that were never popped.
+
+    /// A window record with a portRect and an empty control list.
+    fn alloc_appearance_window(bus: &mut MacMemoryBus, port_rect: (i16, i16, i16, i16)) -> u32 {
+        let window_ptr = bus.alloc(200);
+        bus.write_word(window_ptr + 16, port_rect.0 as u16);
+        bus.write_word(window_ptr + 18, port_rect.1 as u16);
+        bus.write_word(window_ptr + 20, port_rect.2 as u16);
+        bus.write_word(window_ptr + 22, port_rect.3 as u16);
+        bus.write_long(window_ptr + 140, 0);
+        window_ptr
+    }
+
+    /// Push a $AA73 selector into D0 and point A7 at `sp`.
+    fn arm_control_dispatch<C: CpuOps>(cpu: &mut C, selector: u16, sp: u32) {
+        cpu.write_reg(Register::D0, u32::from(selector));
+        cpu.write_reg(Register::A7, sp);
+    }
+
+    #[test]
+    fn control_dispatch_create_root_control_writes_a_handle_and_refuses_a_second_root() {
+        // CreateRootControl(inWindow, VAR outControl): OSErr — Controls.h.
+        // The caller reads its outControl local straight back out without
+        // testing the OSErr, so a trap that pops without writing hands it
+        // stack garbage as a ControlHandle; that is the reason this selector
+        // could not be served by a frame pop alone.
+        let (mut disp, mut cpu, mut bus) = setup();
+        let sp = 0x300000u32;
+        let window_ptr = alloc_appearance_window(&mut bus, (0, 0, 200, 300));
+        let out_control = bus.alloc(4);
+        bus.write_long(out_control, 0xDEAD_BEEF);
+
+        arm_control_dispatch(&mut cpu, 0x0001, sp);
+        bus.write_long(sp, out_control);
+        bus.write_long(sp + 4, window_ptr);
+        bus.write_word(sp + 8, 0xBEEF);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+
+        let root = bus.read_long(out_control);
+        assert_ne!(root, 0, "the root control must be a real handle");
+        assert_ne!(root, 0xDEAD_BEEF, "the caller's slot must be written");
+        assert_eq!(bus.read_word(sp + 8) as i16, 0, "noErr");
+        assert_eq!(
+            cpu.read_reg(Register::A7),
+            sp + 8,
+            "CreateRootControl pops inWindow(4) + outControl(4)"
+        );
+
+        // The root joins the window's control list, and it is invisible so
+        // that DrawControls, FindControl and TestControl all skip it.
+        assert_eq!(bus.read_long(window_ptr + 140), root);
+        let root_ptr = bus.read_long(root);
+        assert_eq!(bus.read_byte(root_ptr + 16), 0, "root control is invisible");
+        assert_eq!(disp.window_root_control(&bus, window_ptr), Some(root));
+
+        // A second call reports errRootAlreadyExists (-30587) and still
+        // writes the existing root, because the caller ignores the error.
+        bus.write_long(out_control, 0xDEAD_BEEF);
+        arm_control_dispatch(&mut cpu, 0x0001, sp);
+        bus.write_long(sp, out_control);
+        bus.write_long(sp + 4, window_ptr);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.read_word(sp + 8) as i16, -30587);
+        assert_eq!(bus.read_long(out_control), root);
+        assert_eq!(cpu.read_reg(Register::A7), sp + 8);
+    }
+
+    #[test]
+    fn control_dispatch_embed_control_records_containment_and_refuses_self_and_root() {
+        // EmbedControl(inControl, inContainer): OSErr — Controls.h. The
+        // structural errors are errCantEmbedIntoSelf (-30594),
+        // errCantEmbedRoot (-30595) and controlHandleInvalidErr (-30599),
+        // MacErrors.h "Control Manager Error Codes".
+        let (mut disp, mut cpu, mut bus) = setup();
+        let sp = 0x300000u32;
+        let window_ptr = alloc_appearance_window(&mut bus, (0, 0, 200, 300));
+        let out_control = bus.alloc(4);
+
+        arm_control_dispatch(&mut cpu, 0x0001, sp);
+        bus.write_long(sp, out_control);
+        bus.write_long(sp + 4, window_ptr);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        let root = bus.read_long(out_control);
+
+        let child = new_control_handle(&mut disp, &mut cpu, &mut bus, window_ptr, false, 0);
+        let group = new_control_handle(&mut disp, &mut cpu, &mut bus, window_ptr, false, 160);
+        // Both were created after the root existed, so the Appearance Manager
+        // has already embedded them in it.
+        assert_eq!(disp.control_embed_parents.get(&child), Some(&root));
+        assert_eq!(disp.control_embed_parents.get(&group), Some(&root));
+
+        for (control, container, expected) in [
+            (child, group, 0i16),
+            (child, child, -30594),
+            (root, group, -30595),
+            (0, group, -30599),
+            (child, 0, -30599),
+        ] {
+            arm_control_dispatch(&mut cpu, 0x0003, sp);
+            bus.write_long(sp, container);
+            bus.write_long(sp + 4, control);
+            bus.write_word(sp + 8, 0xBEEF);
+            disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                bus.read_word(sp + 8) as i16,
+                expected,
+                "EmbedControl(${control:08X} -> ${container:08X})"
+            );
+            assert_eq!(
+                cpu.read_reg(Register::A7),
+                sp + 8,
+                "EmbedControl pops inControl(4) + inContainer(4)"
+            );
+        }
+        assert_eq!(
+            disp.control_embed_parents.get(&child),
+            Some(&group),
+            "the successful embed must have moved the child under the group box"
+        );
+    }
+
+    #[test]
+    fn control_dispatch_activate_and_deactivate_walk_the_embedding_hierarchy() {
+        // ActivateControl / DeactivateControl(inControl): OSErr — Controls.h.
+        // The Appearance Manager applies the change through the embedding
+        // hierarchy, so deactivating a container greys everything inside it;
+        // the hilite values are the Control Manager's own 0 and 255
+        // (kControlInactivePart).
+        let (mut disp, mut cpu, mut bus) = setup();
+        let sp = 0x300000u32;
+        let window_ptr = alloc_appearance_window(&mut bus, (0, 0, 200, 300));
+        let out_control = bus.alloc(4);
+
+        arm_control_dispatch(&mut cpu, 0x0001, sp);
+        bus.write_long(sp, out_control);
+        bus.write_long(sp + 4, window_ptr);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        let root = bus.read_long(out_control);
+
+        let first = new_control_handle(&mut disp, &mut cpu, &mut bus, window_ptr, false, 0);
+        let second = new_control_handle(&mut disp, &mut cpu, &mut bus, window_ptr, false, 1);
+        let first_ptr = bus.read_long(first);
+        let second_ptr = bus.read_long(second);
+
+        arm_control_dispatch(&mut cpu, 0x0008, sp);
+        bus.write_long(sp, root);
+        bus.write_word(sp + 4, 0xBEEF);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.read_word(sp + 4) as i16, 0, "noErr");
+        assert_eq!(
+            cpu.read_reg(Register::A7),
+            sp + 4,
+            "DeactivateControl pops one ControlHandle"
+        );
+        assert_eq!(bus.read_byte(first_ptr + 17), 255);
+        assert_eq!(bus.read_byte(second_ptr + 17), 255);
+
+        arm_control_dispatch(&mut cpu, 0x0007, sp);
+        bus.write_long(sp, root);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.read_word(sp + 4) as i16, 0);
+        assert_eq!(cpu.read_reg(Register::A7), sp + 4);
+        assert_eq!(bus.read_byte(first_ptr + 17), 0);
+        assert_eq!(bus.read_byte(second_ptr + 17), 0);
+
+        // A nil control is controlHandleInvalidErr, and the frame is still
+        // popped.
+        arm_control_dispatch(&mut cpu, 0x0007, sp);
+        bus.write_long(sp, 0);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.read_word(sp + 4) as i16, -30599);
+        assert_eq!(cpu.read_reg(Register::A7), sp + 4);
+    }
+
+    #[test]
+    fn control_dispatch_find_control_under_mouse_returns_the_control_and_its_part() {
+        // FindControlUnderMouse(inWhere, inWindow, VAR outPart): ControlHandle
+        // — Controls.h. Note the shape: the control is the FUNCTION result and
+        // the part code the VAR parameter, the opposite way round from
+        // FindControl. The caller reads that result slot without checking
+        // anything, so a trap that pops without writing it leaves a stack
+        // word being used as a ControlHandle.
+        let (mut disp, mut cpu, mut bus) = setup();
+        let sp = 0x300000u32;
+        let window_ptr = alloc_appearance_window(&mut bus, (0, 0, 200, 300));
+        let out_part = bus.alloc(2);
+        let (ctrl_handle, ctrl_ptr) = alloc_control_handle(&mut bus, (10, 20, 30, 60), 255, 0);
+        bus.write_long(ctrl_ptr, 0);
+        bus.write_long(window_ptr + 140, ctrl_handle);
+        // checkBoxProc, so the part code is inCheckBox (11) rather than the
+        // fixed inButton that FindControl still answers.
+        disp.control_proc_ids.insert(ctrl_ptr, 1);
+
+        arm_control_dispatch(&mut cpu, 0x0009, sp);
+        bus.write_long(sp, out_part);
+        bus.write_long(sp + 4, window_ptr);
+        bus.write_word(sp + 8, 15);
+        bus.write_word(sp + 10, 25);
+        bus.write_long(sp + 12, 0xDEAD_BEEF);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.read_long(sp + 12), ctrl_handle);
+        assert_eq!(bus.read_word(out_part) as i16, 11);
+        assert_eq!(
+            cpu.read_reg(Register::A7),
+            sp + 12,
+            "FindControlUnderMouse pops outPart(4) + inWindow(4) + inWhere(4)"
+        );
+
+        // A miss answers NIL and kControlNoPart, and still writes both.
+        arm_control_dispatch(&mut cpu, 0x0009, sp);
+        bus.write_long(sp, out_part);
+        bus.write_long(sp + 4, window_ptr);
+        bus.write_word(sp + 8, 5);
+        bus.write_word(sp + 10, 5);
+        bus.write_long(sp + 12, 0xDEAD_BEEF);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.read_long(sp + 12), 0);
+        assert_eq!(bus.read_word(out_part), 0);
+        assert_eq!(cpu.read_reg(Register::A7), sp + 12);
+    }
+
+    #[test]
+    fn control_dispatch_handle_control_click_reaches_trackcontrol_through_a_rewritten_frame() {
+        // HandleControlClick(inControl, inWhere, inModifiers, inAction):
+        // ControlPartCode — Controls.h calls it TrackControl with modifiers.
+        // Moving A7 up by two lands inWhere, inControl and the result slot on
+        // TrackControl's actionProc+4, +8 and +12, so TrackControl's own pop
+        // to sp+12 ends on SP+14, where the caller's `move.w (a7)+,d0` reads
+        // the part code.
+        let (mut disp, mut cpu, mut bus) = setup();
+        let sp = 0x300000u32;
+        let window_ptr = alloc_appearance_window(&mut bus, (0, 0, 200, 300));
+        let (ctrl_handle, _) =
+            alloc_button_control(&mut disp, &mut bus, window_ptr, (10, 20, 30, 60));
+
+        arm_control_dispatch(&mut cpu, 0x000A, sp);
+        bus.write_long(sp, 0); // inAction = NIL
+        bus.write_word(sp + 4, 0x0100); // inModifiers = cmdKey
+        bus.write_word(sp + 6, 15); // inWhere.v
+        bus.write_word(sp + 8, 25); // inWhere.h
+        bus.write_long(sp + 10, ctrl_handle);
+        bus.write_word(sp + 14, 0xBEEF);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(bus.read_word(sp + 14) as i16, 10, "inButton");
+        assert_eq!(
+            cpu.read_reg(Register::A7),
+            sp + 14,
+            "HandleControlClick pops inControl(4) + inWhere(4) + inModifiers(2) + inAction(4)"
+        );
+        assert!(
+            !disp.control_click_via_dispatch,
+            "the refire flag must be cleared once tracking is over"
+        );
+    }
+
+    #[test]
+    fn control_dispatch_handle_control_click_retains_tracking_across_a_refire() {
+        // TrackControl does not return until mouse-up; it retains its state
+        // and the runner rewinds the PC onto the trap. Reached through
+        // ControlDispatch that rewind has to land on $AA73, which is what
+        // control_click_via_dispatch tells is_tracking_refire, and the frame
+        // must not be rewritten a second time on the way back in.
+        let (mut disp, mut cpu, mut bus) = setup_with_port();
+        let sp = 0x300000u32;
+        let window_ptr = disp.current_port;
+        let (ctrl_handle, ctrl_ptr) =
+            alloc_button_control(&mut disp, &mut bus, window_ptr, (20, 20, 40, 80));
+
+        disp.mouse_button = true;
+        disp.mouse_pos = (30, 30);
+        arm_control_dispatch(&mut cpu, 0x000A, sp);
+        bus.write_long(sp, 0);
+        bus.write_word(sp + 4, 0);
+        bus.write_word(sp + 6, 30);
+        bus.write_word(sp + 8, 30);
+        bus.write_long(sp + 10, ctrl_handle);
+        bus.write_word(sp + 14, 0xBEEF);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+
+        assert!(disp.control_tracking.is_some());
+        assert!(disp.control_click_via_dispatch);
+        assert!(disp.is_tracking_refire(0xAA73));
+        assert_eq!(
+            cpu.read_reg(Register::A7),
+            sp + 2,
+            "the rewritten TrackControl frame stays parked until mouse-up"
+        );
+        assert_eq!(bus.read_word(sp + 14), 0xBEEF, "no result until mouse-up");
+        assert_eq!(bus.read_byte(ctrl_ptr + 17), 1, "held button is highlighted");
+
+        // The refire: same trap, same A7, frame already rewritten.
+        disp.mouse_button = false;
+        cpu.write_reg(Register::D0, 0x000A);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+
+        assert!(disp.control_tracking.is_none());
+        assert!(!disp.control_click_via_dispatch);
+        assert!(!disp.is_tracking_refire(0xAA73));
+        assert_eq!(bus.read_word(sp + 14) as i16, 10, "inButton on release");
+        assert_eq!(cpu.read_reg(Register::A7), sp + 14);
+    }
+
+    #[test]
+    fn control_dispatch_key_focus_and_idle_selectors_pop_their_frames() {
+        // GetKeyboardFocus(inWindow, VAR outControl): OSErr,
+        // HandleControlKey(inControl, keyCode, charCode, modifiers):
+        // ControlPartCode, and IdleControls(inWindow) — Controls.h. Nothing
+        // in Systemless can take the keyboard focus, so nil focus and
+        // kControlNoPart are the true answers rather than placeholders, and
+        // IdleControls has no control that asked for idle time.
+        let (mut disp, mut cpu, mut bus) = setup();
+        let sp = 0x300000u32;
+        let window_ptr = alloc_appearance_window(&mut bus, (0, 0, 200, 300));
+        let out_control = bus.alloc(4);
+        bus.write_long(out_control, 0xDEAD_BEEF);
+
+        arm_control_dispatch(&mut cpu, 0x000D, sp);
+        bus.write_long(sp, out_control);
+        bus.write_long(sp + 4, window_ptr);
+        bus.write_word(sp + 8, 0xBEEF);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.read_long(out_control), 0, "no control has the focus");
+        assert_eq!(bus.read_word(sp + 8) as i16, 0, "noErr");
+        assert_eq!(
+            cpu.read_reg(Register::A7),
+            sp + 8,
+            "GetKeyboardFocus pops inWindow(4) + outControl(4)"
+        );
+
+        arm_control_dispatch(&mut cpu, 0x000B, sp);
+        bus.write_word(sp, 0x0100); // inModifiers
+        bus.write_word(sp + 2, 0x0D); // inCharCode
+        bus.write_word(sp + 4, 0x24); // inKeyCode
+        bus.write_long(sp + 6, 0); // inControl (the nil focus above)
+        bus.write_word(sp + 10, 0xBEEF);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.read_word(sp + 10) as i16, 0, "kControlNoPart");
+        assert_eq!(
+            cpu.read_reg(Register::A7),
+            sp + 10,
+            "HandleControlKey pops inControl(4) + three words"
+        );
+
+        arm_control_dispatch(&mut cpu, 0x000C, sp);
+        bus.write_long(sp, window_ptr);
+        bus.write_word(sp + 4, 0xBEEF);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cpu.read_reg(Register::A7),
+            sp + 4,
+            "IdleControls is a PROCEDURE: it pops inWindow and reserves nothing"
+        );
+        assert_eq!(
+            bus.read_word(sp + 4),
+            0xBEEF,
+            "IdleControls must not write a result slot the caller never made"
+        );
+    }
+
+    #[test]
+    fn control_dispatch_control_data_round_trips_the_font_style_and_refuses_other_tags() {
+        // Get/SetControlData(inControl, inPart, inTagName, ...): OSErr —
+        // Controls.h. kControlFontStyleTag names a 24-byte
+        // ControlFontStyleRec (flags, font, size, style, mode, just, and two
+        // RGBColors). A control that has never been given one still has one,
+        // and it is all zeroes: flags is a mask of which fields to use, so
+        // zero means "use the window's font". Answering that rather than an
+        // error matters because the caller's idiom is read-modify-write, and
+        // an untouched buffer is whatever was on its stack.
+        let (mut disp, mut cpu, mut bus) = setup();
+        let sp = 0x300000u32;
+        let window_ptr = alloc_appearance_window(&mut bus, (0, 0, 200, 300));
+        let control = new_control_handle(&mut disp, &mut cpu, &mut bus, window_ptr, false, 288);
+        let buffer = bus.alloc(32);
+        let actual_size = bus.alloc(4);
+
+        let get = |disp: &mut TrapDispatcher,
+                       cpu: &mut super::super::test_helpers::MockCpu,
+                       bus: &mut MacMemoryBus,
+                       tag: &[u8; 4],
+                       size: u32| {
+            arm_control_dispatch(cpu, 0x0013, sp);
+            bus.write_long(sp, actual_size);
+            bus.write_long(sp + 4, buffer);
+            bus.write_long(sp + 8, size);
+            bus.write_long(sp + 12, u32::from_be_bytes(*tag));
+            bus.write_word(sp + 16, 0);
+            bus.write_long(sp + 18, control);
+            bus.write_word(sp + 22, 0xBEEF);
+            disp.dispatch_control(true, 0x273, cpu, bus).unwrap().unwrap();
+            assert_eq!(
+                cpu.read_reg(Register::A7),
+                sp + 22,
+                "GetControlData pops 22 bytes of arguments"
+            );
+            bus.read_word(sp + 22) as i16
+        };
+
+        for index in 0..24u32 {
+            bus.write_byte(buffer + index, 0xEE);
+        }
+        assert_eq!(get(&mut disp, &mut cpu, &mut bus, b"font", 24), 0);
+        assert_eq!(bus.read_long(actual_size), 24);
+        for index in 0..24u32 {
+            assert_eq!(
+                bus.read_byte(buffer + index),
+                0,
+                "an unset font style reads back as the all-zero default"
+            );
+        }
+
+        // errDataNotSupported (-30581) for a tag whose layout Systemless does
+        // not know, errDataSizeMismatch (-30591) for a buffer too small.
+        assert_eq!(get(&mut disp, &mut cpu, &mut bus, b"kind", 24), -30581);
+        assert_eq!(get(&mut disp, &mut cpu, &mut bus, b"font", 12), -30591);
+
+        // Set it, then read it back.
+        let style = bus.alloc(24);
+        bus.write_word(style, 0x0047); // flags: font, face, size and just
+        bus.write_word(style + 2, 1046); // font family
+        bus.write_word(style + 4, 12); // size
+        bus.write_word(style + 10, 1); // just: teCenter
+        arm_control_dispatch(&mut cpu, 0x0012, sp);
+        bus.write_long(sp, style);
+        bus.write_long(sp + 4, 24);
+        bus.write_long(sp + 8, u32::from_be_bytes(*b"font"));
+        bus.write_word(sp + 12, 0);
+        bus.write_long(sp + 14, control);
+        bus.write_word(sp + 18, 0xBEEF);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.read_word(sp + 18) as i16, 0, "noErr");
+        assert_eq!(
+            cpu.read_reg(Register::A7),
+            sp + 18,
+            "SetControlData pops 18 bytes of arguments"
+        );
+
+        assert_eq!(get(&mut disp, &mut cpu, &mut bus, b"font", 24), 0);
+        assert_eq!(bus.read_word(buffer), 0x0047);
+        assert_eq!(bus.read_word(buffer + 2), 1046);
+        assert_eq!(bus.read_word(buffer + 4), 12);
+        assert_eq!(bus.read_word(buffer + 10), 1);
+
+        // A wrong size on the way in is refused rather than stored short.
+        arm_control_dispatch(&mut cpu, 0x0012, sp);
+        bus.write_long(sp, style);
+        bus.write_long(sp + 4, 12);
+        bus.write_long(sp + 8, u32::from_be_bytes(*b"font"));
+        bus.write_word(sp + 12, 0);
+        bus.write_long(sp + 14, control);
+        disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.read_word(sp + 18) as i16, -30591);
+        assert_eq!(cpu.read_reg(Register::A7), sp + 18);
+
+        // Disposing the control must not leave its data behind for whatever
+        // control is allocated at the same address next.
+        disp.dispose_control_handle(&mut bus, control);
+        assert!(disp
+            .control_tagged_data
+            .keys()
+            .all(|(handle, _, _)| *handle != control));
+    }
+
+    #[test]
+    fn control_dispatch_declines_selectors_it_does_not_decode() {
+        // A selector whose frame Systemless does not know must fall through
+        // to the unimplemented path, which names it, rather than popping a
+        // guessed number of bytes. $02 is GetRootControl, which nothing has
+        // needed yet; 0 is the poison selector the trap-registry test uses.
+        let (mut disp, mut cpu, mut bus) = setup();
+        let sp = 0x300000u32;
+        for selector in [0x0000u16, 0x0002, 0x0011, 0x00FF] {
+            arm_control_dispatch(&mut cpu, selector, sp);
+            assert!(
+                disp.dispatch_control(true, 0x273, &mut cpu, &mut bus)
+                    .is_none(),
+                "selector ${selector:04X} must decline rather than pop a guess"
+            );
+            assert_eq!(cpu.read_reg(Register::A7), sp);
+        }
     }
 }

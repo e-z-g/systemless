@@ -884,7 +884,7 @@
     DefaultTrapRoute::new(0xAA70, TrapAdapterId::Nonterminal.mask()),
     DefaultTrapRoute::new(0xAA71, TrapAdapterId::Nonterminal.mask()),
     DefaultTrapRoute::new(0xAA72, TrapAdapterId::Nonterminal.mask()),
-    DefaultTrapRoute::new(0xAA73, TrapAdapterId::Nonterminal.mask()),
+    DefaultTrapRoute::new(0xAA73, TrapAdapterId::Control.mask() | TrapAdapterId::Nonterminal.mask()),
     DefaultTrapRoute::new(0xAA74, TrapAdapterId::Nonterminal.mask()),
     DefaultTrapRoute::new(0xAA75, TrapAdapterId::Nonterminal.mask()),
     DefaultTrapRoute::new(0xAA76, TrapAdapterId::Nonterminal.mask()),
