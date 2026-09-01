@@ -4750,7 +4750,13 @@ impl super::TrapDispatcher {
                     // Compression Manager's *GetFilePreview selectors use for
                     // the Standard File loop.
                     0x000A => {
-                        if !self.is_control_tracking() {
+                        // The refire is recognised by the flag rather than by
+                        // `is_control_tracking`, because tracking being live
+                        // is not the same question: a control action procedure
+                        // runs guest code with a TrackControl of its own still
+                        // retained, and a HandleControlClick made from there
+                        // is a first call whose frame does need rewriting.
+                        if !self.control_click_via_dispatch {
                             let action_proc = bus.read_long(sp);
                             bus.write_long(sp + 2, action_proc);
                             cpu.write_reg(Register::A7, sp + 2);
