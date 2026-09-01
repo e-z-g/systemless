@@ -2700,6 +2700,58 @@ fn run_headless(
     }
     game::init_game(&mut runner, &app);
 
+    // Guest-clock cadence for this scripted run.
+    //
+    // A headless run keeps the library default of 12,000 instructions per
+    // tick, which models a machine executing 720,000 instructions a second --
+    // roughly a fortieth of the 25 MHz reference profile the desktop runner
+    // uses. That default is deliberate: it makes ticks cheap in instructions
+    // so a scripted harness reaches a given point in a game quickly, and every
+    // recorded probe schedule in this tree is written against it.
+    //
+    // It also makes the guest clock unusable for anything that reasons about
+    // guest time. The HLE charges the tick budget for work it does natively --
+    // one budget unit per pixel of a CopyBits, sixteen per byte of a resource
+    // load -- so on a machine this slow a single full-screen blit costs about
+    // 25 ticks, which is longer than any game's frame period. An application
+    // that paces itself by waiting for TickCount to reach a deadline then
+    // never waits at all: the deadline is already past by the time the frame
+    // it just drew has been charged for, so it draws the next one immediately
+    // and charges the clock again. Measured on Cythera, that feedback loop
+    // turns 1.3 billion instructions into 15.8 million guest ticks -- 73 guest
+    // hours, 145x the nominal cadence -- of which 94% is the blit surcharge.
+    // `SYSTEMLESS_TRACE_TICK_SOURCES=1` prints that attribution.
+    //
+    // Setting this to the reference machine's cadence (`realtime`, or an
+    // explicit count) makes one full-screen blit cost well under a frame
+    // period again, so the application's own frame limiter engages and guest
+    // ticks track retired instructions. Probes that depend on guest time --
+    // a double click, a drag held under `2 * DoubleTime`, sub-tile movement
+    // paced by the game's scheduler -- need that and cannot work without it.
+    // The cost is that timed waits now consume the instructions they should
+    // have consumed all along, so a schedule written against the default has
+    // to be re-timed.
+    if let Ok(value) = std::env::var("SYSTEMLESS_INSTRUCTIONS_PER_TICK") {
+        let trimmed = value.trim();
+        let requested = if trimmed.eq_ignore_ascii_case("realtime") {
+            Some(systemless::runner::default_realtime_instructions_per_tick(
+                runner.is_powerpc_app(),
+            ))
+        } else {
+            trimmed.parse::<u32>().ok().filter(|value| *value > 0)
+        };
+        match requested {
+            Some(ipt) => {
+                runner.set_instructions_per_tick(ipt);
+                eprintln!("[HEADLESS] Instructions per tick: {}", ipt);
+            }
+            None => eprintln!(
+                "[HEADLESS] ignoring SYSTEMLESS_INSTRUCTIONS_PER_TICK={:?} (want a positive integer or \"realtime\")",
+                value
+            ),
+        }
+    }
+
     let chunk = 100_000;
     // How often the headless run writes a frame. A long run -- the multi-billion
     // instruction ones needed to reach gameplay -- otherwise spends about half
