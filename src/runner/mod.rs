@@ -1398,8 +1398,12 @@ fn dump_tick_sources(final_tick: u32, total_instructions: u64, instructions_per_
     let blit = TSU_WORK_BLIT.load(AtomicOrdering::Relaxed);
     let picture = TSU_WORK_PICTURE.load(AtomicOrdering::Relaxed);
     let resource = TSU_WORK_RESOURCE.load(AtomicOrdering::Relaxed);
+    // The per-kind figures below are the surcharges as the HLE routines
+    // reported them, before `hle_work_units_for_cadence` converts them for
+    // this runner's cadence; `trap_work` above is the converted total that
+    // was actually charged. On a realtime runner the two agree.
     eprintln!(
-        "[TICK-SOURCES] work units: blit={blit} ({} ticks) picture={picture} ({} ticks) resource_load={resource} ({} ticks)",
+        "[TICK-SOURCES] work units as reported: blit={blit} ({} ticks) picture={picture} ({} ticks) resource_load={resource} ({} ticks)",
         blit / per_tick,
         picture / per_tick,
         resource / per_tick,
@@ -6340,7 +6344,9 @@ impl FixtureRunner {
                                 }
                             }
                             let flat_tick_cost = hle_trap_extra_tick_cost(opcode);
-                            let work_tick_cost = self.dispatcher.take_hle_tick_cost();
+                            let reported_work_cost = self.dispatcher.take_hle_tick_cost();
+                            let work_tick_cost =
+                                self.hle_work_units_for_cadence(reported_work_cost);
                             note_tick_units(&TSU_TRAP_FLAT, flat_tick_cost);
                             note_tick_units(&TSU_TRAP_WORK, work_tick_cost);
                             let extra_tick_cost = flat_tick_cost.saturating_add(work_tick_cost);
@@ -8858,6 +8864,55 @@ impl FixtureRunner {
         self.halted_sp = Some(self.m68k.cpu.read_reg(Register::A7));
         self.halted_d0 = Some(self.m68k.cpu.read_reg(Register::D0));
         self.dump_trace();
+    }
+
+    /// Convert an HLE work surcharge into budget units for the cadence this
+    /// runner is actually using.
+    ///
+    /// The surcharges an HLE routine reports through `add_hle_tick_cost` --
+    /// `quickdraw_blit_tick_cost`, `draw_picture_tick_cost`,
+    /// `resource_load_tick_cost` -- are counts of the instructions the ROM
+    /// would have executed to do that work itself, and they were sized
+    /// against the reference machine profile the desktop and browser runners
+    /// use (25 MHz, `default_realtime_instructions_per_tick`). Charged
+    /// unchanged into that profile they behave as intended: a full-screen
+    /// 8-bit CopyBits costs about one tick, comfortably inside a frame.
+    ///
+    /// A scripted runner keeps the library default of 12,000 instructions per
+    /// tick, which is not a machine speed at all -- it is a deliberate fiction
+    /// that makes ticks cheap in instructions so a harness reaches a given
+    /// point in a game quickly. Charging reference-machine instruction counts
+    /// into that budget prices one full-screen blit at about 25 ticks, longer
+    /// than any game's frame period, and that has a consequence beyond the
+    /// arithmetic: an application that paces itself by waiting for TickCount
+    /// to reach a deadline stops waiting altogether, because drawing the
+    /// frame has already carried the clock past the deadline. It draws the
+    /// next frame at once, charges the clock again, and the two feed each
+    /// other. Measured on Cythera, 1.3 billion instructions produced
+    /// 15,774,862 guest ticks -- 73 guest hours, 145 times the nominal
+    /// cadence -- with 94% of it coming from the blit surcharge and 719,000
+    /// full-screen-scale blits issued in a run whose content lasts a couple
+    /// of minutes on a real Mac.
+    ///
+    /// So the surcharge is converted rather than copied: the work took
+    /// `units / reference` ticks on the machine the constant was sized for,
+    /// and that fraction of a tick is what gets charged here. A runner at or
+    /// above the reference cadence -- both realtime profiles, including the
+    /// 120 MHz PowerPC one -- is left exactly as it was, so desktop and
+    /// browser pacing is unchanged; only the artificially fast scripted clock
+    /// is affected. Work is never made free: a non-zero surcharge always
+    /// costs at least one unit.
+    fn hle_work_units_for_cadence(&self, units: i32) -> i32 {
+        if units <= 0 {
+            return units;
+        }
+        let reference = u64::from(default_realtime_instructions_per_tick(false).max(1));
+        let cadence = u64::from(self.instructions_per_tick);
+        if cadence >= reference {
+            return units;
+        }
+        let scaled = (units as u64).saturating_mul(cadence) / reference;
+        scaled.max(1).min(units as u64) as i32
     }
 
     fn charge_tick_budget(&mut self, units: i32, tick_cap: Option<u32>) -> bool {
@@ -24709,6 +24764,53 @@ mod tests {
         assert_eq!(
             runner.dispatcher.game_trap_count, before_game,
             "EventAvail remains excluded from game_trap_count as an idle trap"
+        );
+    }
+
+    #[test]
+    fn hle_work_surcharges_are_converted_for_a_scripted_cadence() {
+        // A full-screen 8-bit CopyBits: 640x480 at one unit per pixel, plus
+        // the fixed per-call term. `quickdraw_blit_tick_cost` sizes that
+        // against the reference machine profile, where it is about one tick.
+        let full_screen_blit = crate::trap::dispatch::TrapDispatcher::quickdraw_blit_tick_cost(
+            640, 480, 8, 8, false,
+        ) as i32;
+        let reference = default_realtime_instructions_per_tick(false);
+
+        let mut runner = FixtureRunner::new(8 * 1024 * 1024, FixtureRunnerConfig::default());
+
+        // The library default is the scripted cadence, which is not a machine
+        // speed: charged unmodified there, one such blit would cost 25 ticks --
+        // longer than a frame -- and defeat any TickCount-deadline frame
+        // limiter the guest has. It is converted instead.
+        assert_eq!(runner.instructions_per_tick(), INSTRUCTIONS_PER_TICK);
+        let scripted = runner.hle_work_units_for_cadence(full_screen_blit);
+        assert!(
+            scripted < full_screen_blit / 30,
+            "scripted cadence should charge a fraction of the reference cost, got {scripted} of {full_screen_blit}"
+        );
+        assert!(
+            scripted < INSTRUCTIONS_PER_TICK as i32,
+            "a full-screen blit must cost less than one tick, got {scripted}"
+        );
+
+        // Work is never free: a surcharge too small to scale still costs one
+        // unit, so an application cannot get unlimited HLE work per tick.
+        assert_eq!(runner.hle_work_units_for_cadence(1), 1);
+        assert_eq!(runner.hle_work_units_for_cadence(0), 0);
+
+        // The desktop and browser runners set the reference cadence, and a
+        // PowerPC profile sets a faster one still. Neither is touched, so
+        // wall-clock-paced pacing is exactly as it was.
+        runner.set_instructions_per_tick(reference);
+        assert_eq!(
+            runner.hle_work_units_for_cadence(full_screen_blit),
+            full_screen_blit
+        );
+        runner.set_instructions_per_tick(default_realtime_instructions_per_tick(true));
+        assert_eq!(
+            runner.hle_work_units_for_cadence(full_screen_blit),
+            full_screen_blit
         );
     }
 
