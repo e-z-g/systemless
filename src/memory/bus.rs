@@ -182,6 +182,22 @@ static MEM_READ_TRACE_RANGE: OnceLock<Option<(u32, u32)>> = OnceLock::new();
 #[cfg(not(target_arch = "wasm32"))]
 static MEM_WRITE_TRACE_RANGE: OnceLock<Option<(u32, u32)>> = OnceLock::new();
 
+// The block read and write paths consult these on every call, and those paths
+// are not gated by architecture, so WebAssembly needs the same stub treatment
+// `fb_write_trace_range` above already has: no environment to read, so no
+// range, so the fast path stays fast.
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn mem_read_trace_range() -> Option<(u32, u32)> {
+    None
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn mem_write_trace_range() -> Option<(u32, u32)> {
+    None
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[inline]
 fn mem_read_trace_range() -> Option<(u32, u32)> {
