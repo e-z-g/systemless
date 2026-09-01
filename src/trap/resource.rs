@@ -853,7 +853,9 @@ impl super::TrapDispatcher {
         let Some(byte_len) = bus.get_alloc_size(ptr) else {
             return;
         };
-        self.add_hle_tick_cost(Self::resource_load_tick_cost(byte_len));
+        let load_cost = Self::resource_load_tick_cost(byte_len);
+        crate::runner::note_hle_work_units(crate::runner::HleWorkKind::ResourceLoad, load_cost);
+        self.add_hle_tick_cost(load_cost);
     }
 
     fn resource_trace_chain(&self) -> String {
