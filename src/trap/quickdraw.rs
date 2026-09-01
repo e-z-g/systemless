@@ -3587,13 +3587,15 @@ impl super::TrapDispatcher {
                     || src_info.pixel_size != dst_info.pixel_size
                     || mode_base != 0
                     || !no_clipping;
-                self.add_hle_tick_cost(Self::quickdraw_blit_tick_cost(
+                let blit_cost = Self::quickdraw_blit_tick_cost(
                     eff_width as u32,
                     eff_height as u32,
                     src_info.pixel_size,
                     dst_info.pixel_size,
                     transformed_blit,
-                ));
+                );
+                crate::runner::note_hle_work_units(crate::runner::HleWorkKind::Blit, blit_cost);
+                self.add_hle_tick_cost(blit_cost);
                 let (copy_fg_rgb, copy_bg_rgb) = self.copy_bits_port_draw_colors(bus, port);
 
                 // Identity-blit fast path: when nothing in the inner loop
@@ -8627,11 +8629,16 @@ impl super::TrapDispatcher {
                     }
                     let cost_width = cost_right.saturating_sub(cost_left);
                     let cost_height = cost_bottom.saturating_sub(cost_top);
-                    self.add_hle_tick_cost(Self::draw_picture_tick_cost(
+                    let picture_cost = Self::draw_picture_tick_cost(
                         cost_width as u32,
                         cost_height as u32,
                         picture_bytes,
-                    ));
+                    );
+                    crate::runner::note_hle_work_units(
+                        crate::runner::HleWorkKind::Picture,
+                        picture_cost,
+                    );
+                    self.add_hle_tick_cost(picture_cost);
                     let device_ct_seed =
                         Self::ctab_seed(bus, self.current_gdevice_ctab_handle(bus)).unwrap_or(0);
                     let (ok, pict_clut) = super::pict::draw_picture(
@@ -20637,13 +20644,15 @@ impl super::TrapDispatcher {
             || vis_rgn_handle != 0
             || clip_rgn_handle != 0
             || mask_rgn != 0;
-        self.add_hle_tick_cost(Self::quickdraw_blit_tick_cost(
+        let blit_cost = Self::quickdraw_blit_tick_cost(
             eff_width as u32,
             eff_height as u32,
             src_info.pixel_size,
             dst_info.pixel_size,
             transformed_blit,
-        ));
+        );
+        crate::runner::note_hle_work_units(crate::runner::HleWorkKind::Blit, blit_cost);
+        self.add_hle_tick_cost(blit_cost);
 
         let source_snapshot = if src_info.base == dst_info.base {
             let mut row_start = u32::MAX;

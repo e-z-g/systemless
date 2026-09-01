@@ -1127,6 +1127,169 @@ pub fn dump_wait_stats() {
     }
 }
 
+// Guest-clock attribution (SYSTEMLESS_TRACE_TICK_SOURCES=1).
+//
+// The guest clock has seven producers, and when it runs away from the
+// instruction budget the only question worth asking first is *which one*.
+// Every production call to `advance_guest_tick` goes through
+// `advance_guest_tick_from`, which tags the tick with the reason it was
+// produced; the totals print when the runner is dropped, beside the final
+// tick and the retired instruction count, so the ratio can be read directly
+// rather than inferred from a trap census.
+//
+// Motivating measurement: a Cythera run of 300M instructions reported
+// 263,689 ticks where the nominal cadence (INSTRUCTIONS_PER_TICK) predicts
+// ~25,000 — a guest clock running ten times fast, and a hundred times fast
+// once the game reaches its world. `SYSTEMLESS_DISABLE_SPIN_FASTFWD=1` did
+// not move the number and `SYSTEMLESS_WAIT_STATS=1` showed `parked=0`, which
+// eliminated the two obvious suspects and left no way to attribute the rest.
+// Hence this counter set: it is the cheapest instrument that can say
+// "N of these ticks were bought with instructions and M were free".
+static TICK_SOURCE_STATS_ON: OnceLock<bool> = OnceLock::new();
+fn tick_source_stats_enabled() -> bool {
+    *TICK_SOURCE_STATS_ON
+        .get_or_init(|| std::env::var_os("SYSTEMLESS_TRACE_TICK_SOURCES").is_some())
+}
+/// Ticks paid for out of the instruction budget: the nominal cadence of
+/// `INSTRUCTIONS_PER_TICK` instructions (plus per-trap HLE surcharges) per
+/// tick. This is the only producer whose rate is bounded by guest execution.
+static TS_INSTRUCTION_BUDGET: AtomicU64 = AtomicU64::new(0);
+/// Ticks drained for a `WaitNextEvent` sleep interval.
+static TS_WAIT_SLEEP: AtomicU64 = AtomicU64::new(0);
+/// Ticks drained for a `Delay` request.
+static TS_DELAY: AtomicU64 = AtomicU64::new(0);
+/// Ticks synthesised to skip a decoded `TickCount` spin-wait.
+static TS_SPIN_FASTFWD: AtomicU64 = AtomicU64::new(0);
+/// Ticks issued so a GUI-retained tracking loop keeps time moving.
+static TS_GUI_RETAINED_IDLE: AtomicU64 = AtomicU64::new(0);
+/// Ticks charged against retired PowerPC cycles.
+static TS_PPC_CYCLES: AtomicU64 = AtomicU64::new(0);
+/// Ticks a frontend asked for directly (`force_advance_guest_tick`).
+static TS_EXTERNAL: AtomicU64 = AtomicU64::new(0);
+
+// The instruction-budget bucket has three contributors and they are not
+// comparable: retired guest instructions, the flat per-trap surcharge from
+// `hle_trap_extra_tick_cost`, and the work-proportional surcharges HLE
+// routines add through `add_hle_tick_cost` (per pixel blitted, per byte
+// loaded). These count *budget units*, not ticks; divide by
+// `instructions_per_tick` for ticks.
+static TSU_INSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
+static TSU_TRAP_FLAT: AtomicU64 = AtomicU64::new(0);
+static TSU_TRAP_WORK: AtomicU64 = AtomicU64::new(0);
+
+fn note_tick_units(counter: &AtomicU64, units: i32) {
+    if tick_source_stats_enabled() && units > 0 {
+        counter.fetch_add(units as u64, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Which HLE routine bought a work surcharge. The three producers charge on
+/// very different scales -- per pixel, per picture byte, per resource byte --
+/// so a bare total cannot say which one is moving the guest clock.
+#[derive(Clone, Copy)]
+pub(crate) enum HleWorkKind {
+    Blit,
+    Picture,
+    ResourceLoad,
+}
+static TSU_WORK_BLIT: AtomicU64 = AtomicU64::new(0);
+static TSU_WORK_PICTURE: AtomicU64 = AtomicU64::new(0);
+static TSU_WORK_RESOURCE: AtomicU64 = AtomicU64::new(0);
+static TSU_CALLS_BLIT: AtomicU64 = AtomicU64::new(0);
+static TSU_CALLS_PICTURE: AtomicU64 = AtomicU64::new(0);
+static TSU_CALLS_RESOURCE: AtomicU64 = AtomicU64::new(0);
+/// Blit surcharges bucketed by `floor(log2(units))`. "One expensive blit per
+/// frame" and "a thousand cheap ones" produce the same total and want
+/// different answers, so the shape of the distribution is recorded too.
+static TSU_BLIT_BUCKETS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+
+pub(crate) fn note_hle_work_units(kind: HleWorkKind, units: u32) {
+    if !tick_source_stats_enabled() || units == 0 {
+        return;
+    }
+    let (total, calls) = match kind {
+        HleWorkKind::Blit => (&TSU_WORK_BLIT, &TSU_CALLS_BLIT),
+        HleWorkKind::Picture => (&TSU_WORK_PICTURE, &TSU_CALLS_PICTURE),
+        HleWorkKind::ResourceLoad => (&TSU_WORK_RESOURCE, &TSU_CALLS_RESOURCE),
+    };
+    total.fetch_add(u64::from(units), AtomicOrdering::Relaxed);
+    calls.fetch_add(1, AtomicOrdering::Relaxed);
+    if matches!(kind, HleWorkKind::Blit) {
+        let bucket = (31 - units.leading_zeros()) as usize;
+        TSU_BLIT_BUCKETS[bucket].fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
+fn note_tick_source(counter: &AtomicU64) {
+    if tick_source_stats_enabled() {
+        counter.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+}
+
+/// Print the guest-clock attribution (no-op when the env var is unset).
+fn dump_tick_sources(final_tick: u32, total_instructions: u64, instructions_per_tick: u32) {
+    if !tick_source_stats_enabled() {
+        return;
+    }
+    let budget = TS_INSTRUCTION_BUDGET.load(AtomicOrdering::Relaxed);
+    let sleep = TS_WAIT_SLEEP.load(AtomicOrdering::Relaxed);
+    let delay = TS_DELAY.load(AtomicOrdering::Relaxed);
+    let spin = TS_SPIN_FASTFWD.load(AtomicOrdering::Relaxed);
+    let gui_idle = TS_GUI_RETAINED_IDLE.load(AtomicOrdering::Relaxed);
+    let ppc = TS_PPC_CYCLES.load(AtomicOrdering::Relaxed);
+    let external = TS_EXTERNAL.load(AtomicOrdering::Relaxed);
+    let total = budget + sleep + delay + spin + gui_idle + ppc + external;
+    eprintln!(
+        "[TICK-SOURCES] total={total} budget={budget} wne_sleep={sleep} delay={delay} spin_fastfwd={spin} gui_idle={gui_idle} ppc={ppc} external={external}"
+    );
+    let nominal = if instructions_per_tick == 0 {
+        0
+    } else {
+        total_instructions / u64::from(instructions_per_tick)
+    };
+    eprintln!(
+        "[TICK-SOURCES] final_tick={final_tick} instructions={total_instructions} nominal_ticks={nominal} (at {instructions_per_tick} instructions/tick)"
+    );
+    let per_tick = u64::from(instructions_per_tick.max(1));
+    let units_instructions = TSU_INSTRUCTIONS.load(AtomicOrdering::Relaxed);
+    let units_flat = TSU_TRAP_FLAT.load(AtomicOrdering::Relaxed);
+    let units_work = TSU_TRAP_WORK.load(AtomicOrdering::Relaxed);
+    eprintln!(
+        "[TICK-SOURCES] budget units: instructions={units_instructions} ({} ticks) trap_flat={units_flat} ({} ticks) trap_work={units_work} ({} ticks)",
+        units_instructions / per_tick,
+        units_flat / per_tick,
+        units_work / per_tick,
+    );
+    let blit = TSU_WORK_BLIT.load(AtomicOrdering::Relaxed);
+    let picture = TSU_WORK_PICTURE.load(AtomicOrdering::Relaxed);
+    let resource = TSU_WORK_RESOURCE.load(AtomicOrdering::Relaxed);
+    eprintln!(
+        "[TICK-SOURCES] work units: blit={blit} ({} ticks) picture={picture} ({} ticks) resource_load={resource} ({} ticks)",
+        blit / per_tick,
+        picture / per_tick,
+        resource / per_tick,
+    );
+    eprintln!(
+        "[TICK-SOURCES] work calls: blit={} picture={} resource_load={}",
+        TSU_CALLS_BLIT.load(AtomicOrdering::Relaxed),
+        TSU_CALLS_PICTURE.load(AtomicOrdering::Relaxed),
+        TSU_CALLS_RESOURCE.load(AtomicOrdering::Relaxed),
+    );
+    for (bucket, counter) in TSU_BLIT_BUCKETS.iter().enumerate() {
+        let calls = counter.load(AtomicOrdering::Relaxed);
+        if calls == 0 {
+            continue;
+        }
+        let low = 1u64 << bucket;
+        eprintln!(
+            "[TICK-SOURCES]   blits costing {low}..{} units: {calls} ({} units total, {} ticks)",
+            low * 2 - 1,
+            calls * low * 3 / 2,
+            calls * low * 3 / 2 / per_tick,
+        );
+    }
+}
+
 fn spin_wait_fastfwd_force_on() -> bool {
     *SPIN_WAIT_FASTFWD_FORCE_ON
         .get_or_init(|| std::env::var_os("SYSTEMLESS_SPIN_WAIT_FASTFWD").is_some())
@@ -2908,7 +3071,7 @@ impl FixtureRunner {
     /// Used by the GUI runner to force-advance ticks when the CPU can't
     /// keep up with wall-clock time (e.g. during expensive PICT draws).
     pub fn force_advance_guest_tick(&mut self) {
-        self.advance_guest_tick();
+        self.advance_guest_tick_from(&TS_EXTERNAL);
     }
 
     pub fn set_output_path(&mut self, path: std::path::PathBuf) {
@@ -5218,7 +5381,7 @@ impl FixtureRunner {
                     return AdvanceResult::CapHit;
                 }
             }
-            self.advance_guest_tick();
+            self.advance_guest_tick_from(&TS_SPIN_FASTFWD);
             if self.active_interrupt_callback.is_some() {
                 return AdvanceResult::Interrupted;
             }
@@ -5711,6 +5874,7 @@ impl FixtureRunner {
                 self.total_instructions = self.total_instructions.wrapping_add(executed as u64);
                 if !sound_work_only {
                     let charge_units = executed as i32 - i32::from(precharged);
+                    note_tick_units(&TSU_INSTRUCTIONS, charge_units);
                     if self.charge_tick_budget(charge_units, tick_cap) {
                         tick_cap_reached = true;
                     }
@@ -5841,8 +6005,11 @@ impl FixtureRunner {
                                     break;
                                 }
                             }
-                            let extra_tick_cost = hle_trap_extra_tick_cost(opcode)
-                                .saturating_add(self.dispatcher.take_hle_tick_cost());
+                            let flat_tick_cost = hle_trap_extra_tick_cost(opcode);
+                            let work_tick_cost = self.dispatcher.take_hle_tick_cost();
+                            note_tick_units(&TSU_TRAP_FLAT, flat_tick_cost);
+                            note_tick_units(&TSU_TRAP_WORK, work_tick_cost);
+                            let extra_tick_cost = flat_tick_cost.saturating_add(work_tick_cost);
                             if extra_tick_cost > 0
                                 && self.charge_tick_budget(extra_tick_cost, tick_cap)
                             {
@@ -8447,7 +8614,7 @@ impl FixtureRunner {
                         return true;
                     }
                 }
-                self.advance_guest_tick();
+                self.advance_guest_tick_from(&TS_PPC_CYCLES);
             }
             self.tick_budget += self.instructions_per_tick as i32;
         }
@@ -8602,7 +8769,7 @@ impl FixtureRunner {
                     return true;
                 }
             }
-            self.advance_guest_tick();
+            self.advance_guest_tick_from(&TS_INSTRUCTION_BUDGET);
             self.tick_budget += self.instructions_per_tick as i32;
             if self.active_interrupt_callback.is_some() {
                 return false;
@@ -8614,6 +8781,17 @@ impl FixtureRunner {
             }
         }
         false
+    }
+
+    /// Advance the guest clock and record which producer asked for it.
+    ///
+    /// Every production caller goes through here rather than through
+    /// `advance_guest_tick` directly, so `SYSTEMLESS_TRACE_TICK_SOURCES=1`
+    /// can attribute the guest clock. Tests call `advance_guest_tick`
+    /// unattributed, which is why that one stays.
+    fn advance_guest_tick_from(&mut self, source: &'static AtomicU64) -> u32 {
+        note_tick_source(source);
+        self.advance_guest_tick()
     }
 
     fn advance_guest_tick(&mut self) -> u32 {
@@ -8843,7 +9021,7 @@ impl FixtureRunner {
         if let Some(cap) = tick_cap {
             while self.dispatcher.pending_wait_sleep_ticks > 0 && self.guest_tick() < cap {
                 self.dispatcher.pending_wait_sleep_ticks -= 1;
-                self.advance_guest_tick();
+                self.advance_guest_tick_from(&TS_WAIT_SLEEP);
                 self.tick_budget = self.instructions_per_tick as i32;
                 if self.active_interrupt_callback.is_some() {
                     break;
@@ -8879,7 +9057,7 @@ impl FixtureRunner {
             self.dispatcher.pending_wait_sleep_ticks = 0;
             self.dispatcher.pending_wait_next_event_return = None;
             for _ in 0..advance {
-                self.advance_guest_tick();
+                self.advance_guest_tick_from(&TS_WAIT_SLEEP);
                 self.tick_budget = self.instructions_per_tick as i32;
                 if self.active_interrupt_callback.is_some() {
                     break;
@@ -8890,7 +9068,7 @@ impl FixtureRunner {
 
         while self.dispatcher.pending_wait_sleep_ticks > 0 {
             self.dispatcher.pending_wait_sleep_ticks -= 1;
-            self.advance_guest_tick();
+            self.advance_guest_tick_from(&TS_WAIT_SLEEP);
             self.tick_budget = self.instructions_per_tick as i32;
 
             if self.active_interrupt_callback.is_some() {
@@ -8920,7 +9098,7 @@ impl FixtureRunner {
                 }
             }
             self.dispatcher.pending_delay_ticks -= 1;
-            self.advance_guest_tick();
+            self.advance_guest_tick_from(&TS_DELAY);
             self.tick_budget = self.instructions_per_tick as i32;
             if self.active_interrupt_callback.is_some() {
                 break;
@@ -8946,7 +9124,7 @@ impl FixtureRunner {
             }
         }
 
-        self.advance_guest_tick();
+        self.advance_guest_tick_from(&TS_GUI_RETAINED_IDLE);
         self.tick_budget = self.instructions_per_tick as i32;
 
         tick_cap
@@ -10660,6 +10838,11 @@ impl Drop for FixtureRunner {
         self.print_ppc_unimpl_histogram(40);
         self.print_ppc_gworld_dump(8);
         self.dispatcher.print_trap_timing_histogram(40);
+        dump_tick_sources(
+            self.guest_tick(),
+            self.total_instructions,
+            self.instructions_per_tick,
+        );
     }
 }
 
