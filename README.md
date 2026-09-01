@@ -337,6 +337,9 @@ name.
 | `SYSTEMLESS_TRACE_LOADSEG` | Logs Segment Loader jump-table patching. |
 | `SYSTEMLESS_TRACE_TRAP_COUNTS` | Prints trap dispatch frequency summaries. |
 | `SYSTEMLESS_SOFTWARE_CURSOR` | Restores the composited guest cursor overlay instead of the hardware pointer (macOS). |
+| `SYSTEMLESS_DUMP_MEM` | Writes a raw image of guest RAM to the named path (headless). |
+| `SYSTEMLESS_DUMP_MEM_RANGE` | Narrows that dump to `<start_hex>:<len_hex>`. |
+| `SYSTEMLESS_DUMP_MEM_AT` | Takes the dump after N instructions instead of at the end of the run. |
 
 ## References & Documentation Conventions
 
