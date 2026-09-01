@@ -19040,8 +19040,28 @@ mod tests {
         assert_eq!(bus.read_word(sp + 6), 0xFFFF);
         assert_eq!(bus.read_word(event_ptr), 23);
         assert_eq!(bus.read_long(event_ptr + 2), 0x61657674);
-        assert_eq!(disp.event_queue.len(), 1);
-        assert_eq!(disp.event_queue.front().map(|event| event.what), Some(23));
+
+        // EventAvail reports the launch event but must not queue it. It once
+        // did, and that lost the event outright whenever the inspecting path
+        // did not hold the same queue the delivery path drains: the one-shot
+        // flag was spent on a queue nobody read, and the application never
+        // received kAEOpenApplication. Reporting without queueing is
+        // indistinguishable to the guest -- the event is still described here,
+        // and still delivered exactly once below.
+        assert!(disp.event_queue.is_empty(), "EventAvail must not queue it");
+        assert!(!disp.sent_open_app_event, "nor spend the delivery attempt");
+
+        // A following GetNextEvent still delivers it, exactly once.
+        bus.write_long(sp, event_ptr);
+        bus.write_word(sp + 4, 0x0400);
+        bus.write_word(sp + 6, 0x0000);
+        cpu.write_reg(Register::A7, sp);
+        let deliver = disp.dispatch_toolbox(true, 0x170, &mut cpu, &mut bus);
+        assert!(deliver.unwrap().is_ok());
+        assert_eq!(bus.read_word(sp + 6), 0xFFFF);
+        assert_eq!(bus.read_word(event_ptr), 23);
+        assert!(disp.sent_open_app_event);
+        assert!(disp.event_queue.is_empty());
     }
 
     #[test]
