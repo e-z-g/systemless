@@ -4656,6 +4656,66 @@ impl super::TrapDispatcher {
         }
     }
 
+    /// The command ID an Appearance-era application assigned to a menu item.
+    ///
+    /// Command IDs are not stored in the `MENU` resource. An application built
+    /// against the Appearance Manager ships an `xmnu` resource beside each
+    /// `MENU` of the same id, and the Menu Manager is expected to read the
+    /// command IDs out of it; `SetMenuItemCommandID` is only for menus built
+    /// at run time, and an application that ships `xmnu` never calls it.
+    ///
+    /// The resource is a version word, an item count, and then one entry per
+    /// item in order. The entry's leading word says whether the item carries a
+    /// command: zero for one that does not -- a separator -- and that word is
+    /// the whole entry; otherwise the entry is 30 bytes and its command ID is
+    /// the long at +2. Cythera's `xmnu` 129 parses to exactly its 252 bytes
+    /// this way, giving Save = 5 and Quit = 10.
+    ///
+    /// Returning zero for everything, as this did before, is not the harmless
+    /// default it looks like. Zero is the documented "no command ID", and a
+    /// caller is free to treat it as "not handled" rather than falling back to
+    /// menu and item -- Cythera does exactly that, so every item of its File
+    /// menu was silently dropped, Save and Quit included.
+    fn menu_item_command_id(
+        &mut self,
+        bus: &mut MacMemoryBus,
+        menu_handle: u32,
+        item: i16,
+    ) -> u32 {
+        const ENTRY_BYTES: u32 = 30;
+        const MAX_ITEMS: u16 = 255;
+
+        if menu_handle == 0 || item < 1 {
+            return 0;
+        }
+        let menu_ptr = bus.read_long(menu_handle);
+        if menu_ptr == 0 {
+            return 0;
+        }
+        let menu_id = bus.read_word(menu_ptr) as i16;
+        let Some((_, res_ptr)) = self.find_or_load_resource_any(bus, *b"xmnu", menu_id) else {
+            return 0;
+        };
+        if res_ptr == 0 {
+            return 0;
+        }
+
+        let count = bus.read_word(res_ptr + 2).min(MAX_ITEMS);
+        let mut offset = res_ptr + 4;
+        for index in 1..=count {
+            let carries_command = bus.read_word(offset) != 0;
+            if !carries_command {
+                offset += 2;
+                continue;
+            }
+            if index as i16 == item {
+                return bus.read_long(offset + 2);
+            }
+            offset += ENTRY_BYTES;
+        }
+        0
+    }
+
     fn pack0_fallback<C: CpuOps>(
         &mut self,
         cpu: &mut C,
@@ -17200,9 +17260,18 @@ impl super::TrapDispatcher {
                         Ok(())
                     }
                     0x0503 => {
+                        // GetMenuItemCommandID(menu: MenuHandle;
+                        //     item: MenuItemIndex; VAR outCommandID:
+                        //     MenuCommand): OSStatus
+                        //
+                        // Pascal frame: SP+0 = VAR outCommandID (4),
+                        // SP+4 = item (2), SP+6 = menu (4), result at SP+10.
                         let out_command_id = bus.read_long(sp);
+                        let item = bus.read_word(sp + 4) as i16;
+                        let menu_handle = bus.read_long(sp + 6);
+                        let command_id = self.menu_item_command_id(bus, menu_handle, item);
                         if out_command_id != 0 {
-                            bus.write_long(out_command_id, 0);
+                            bus.write_long(out_command_id, command_id);
                         }
                         bus.write_word(sp + 10, 0);
                         cpu.write_reg(Register::A7, sp + 10);
@@ -25202,6 +25271,70 @@ mod tests {
         let list_ptr = bus.read_long(list_handle);
         let data_bounds_bottom = bus.read_word(list_ptr + 76) as i16;
         assert_eq!(data_bounds_bottom, 3);
+    }
+
+    // MenuDispatch ($A825) selector $0503 — GetMenuItemCommandID
+    // Inside Macintosh: Appearance Manager / Menu Manager. An Appearance-era
+    // application ships an 'xmnu' beside each 'MENU' and never calls
+    // SetMenuItemCommandID, so the command IDs have to come from the resource.
+    #[test]
+    fn get_menu_item_command_id_reads_the_xmnu_resource() {
+        let (mut disp, mut cpu, mut bus) = setup();
+
+        // 'xmnu' shaped like Cythera's: version, item count, then one entry
+        // per item -- a bare zero word for an item with no command, else a
+        // 30-byte entry whose command ID is the long at +2.
+        fn item_entry(xmnu: &mut Vec<u8>, command: u32) {
+            xmnu.extend_from_slice(&[0x00, 0x01]);
+            xmnu.extend_from_slice(&command.to_be_bytes());
+            xmnu.extend_from_slice(&[0u8; 24]);
+        }
+        let mut xmnu: Vec<u8> = vec![0x00, 0x00, 0x00, 0x04];
+        item_entry(&mut xmnu, 3); // item 1
+        xmnu.extend_from_slice(&[0x00, 0x00]); // item 2: separator
+        item_entry(&mut xmnu, 5); // item 3
+        item_entry(&mut xmnu, 10); // item 4
+        assert_eq!(xmnu.len(), 4 + 30 + 2 + 30 + 30);
+        disp.install_test_resource(&mut bus, *b"xmnu", 129, &xmnu);
+
+        // A menu record whose first word is the menu id, behind a handle.
+        let menu_ptr = bus.alloc(64);
+        bus.write_word(menu_ptr, 129);
+        let menu_handle = bus.alloc(4);
+        bus.write_long(menu_handle, menu_ptr);
+
+        let out = bus.alloc(4);
+        let mut command_for = |disp: &mut TrapDispatcher,
+                               cpu: &mut MockCpu,
+                               bus: &mut MacMemoryBus,
+                               item: u16| {
+            bus.write_long(out, 0xDEAD_BEEF);
+            let sp = TEST_SP;
+            cpu.write_reg(Register::A7, sp);
+            bus.write_long(sp, out);
+            bus.write_word(sp + 4, item);
+            bus.write_long(sp + 6, menu_handle);
+            bus.write_word(sp + 10, 0xFFFF);
+            cpu.write_reg(Register::D0, 0x0503);
+            let result = disp.dispatch_toolbox(true, 0x025, cpu, bus);
+            assert!(result.unwrap().is_ok());
+            assert_eq!(bus.read_word(cpu.read_reg(Register::A7)), 0, "noErr");
+            bus.read_long(out)
+        };
+
+        assert_eq!(command_for(&mut disp, &mut cpu, &mut bus, 1), 3);
+        assert_eq!(
+            command_for(&mut disp, &mut cpu, &mut bus, 2),
+            0,
+            "a separator carries no command"
+        );
+        assert_eq!(command_for(&mut disp, &mut cpu, &mut bus, 3), 5);
+        assert_eq!(command_for(&mut disp, &mut cpu, &mut bus, 4), 10);
+        assert_eq!(
+            command_for(&mut disp, &mut cpu, &mut bus, 9),
+            0,
+            "an item past the end carries no command"
+        );
     }
 
     // Pack0 / List Manager ($A9E7) — LAddColumn $0004 and LDelColumn $0020
