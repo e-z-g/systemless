@@ -2552,6 +2552,71 @@ fn relaunch_with_native_guest_identity(game_path: &std::path::Path) {
     }
 }
 
+/// A one-shot raw image of guest memory, for offline analysis.
+///
+/// Debug scaffolding, entirely inert unless `SYSTEMLESS_DUMP_MEM` names an
+/// output path. It exists because a 68K application's A5 world -- its jump
+/// table and its static data, vtables included -- is stored in the archive as
+/// a compressed `DATA 0` image and only exists in expanded form once the
+/// Segment Loader has run. Nothing outside a running process can produce it,
+/// so a static analysis of the `CODE` resources cannot resolve a jump-table
+/// slot or a vtable slot to a routine without one dump of the real thing.
+///
+/// `SYSTEMLESS_DUMP_MEM_RANGE=<start_hex>:<len_hex>` narrows the range (the
+/// default is all of RAM) and `SYSTEMLESS_DUMP_MEM_AT=<instructions>` picks
+/// the moment (the default is the end of the run).
+struct MemoryDumpRequest {
+    path: String,
+    start: u32,
+    len: u32,
+    at: usize,
+    done: bool,
+}
+
+fn memory_dump_request() -> Option<MemoryDumpRequest> {
+    let path = std::env::var("SYSTEMLESS_DUMP_MEM").ok()?;
+    let (start, len) = match std::env::var("SYSTEMLESS_DUMP_MEM_RANGE") {
+        Ok(spec) => {
+            let (head, tail) = spec.split_once(':').unwrap_or(("0", "0"));
+            let parse = |value: &str| {
+                u32::from_str_radix(value.trim().trim_start_matches("0x"), 16).unwrap_or(0)
+            };
+            (parse(head), parse(tail))
+        }
+        Err(_) => (0, u32::MAX),
+    };
+    let at = std::env::var("SYSTEMLESS_DUMP_MEM_AT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(usize::MAX);
+    Some(MemoryDumpRequest {
+        path,
+        start,
+        len,
+        at,
+        done: false,
+    })
+}
+
+fn write_memory_dump(runner: &FixtureRunner, request: &mut MemoryDumpRequest, total: usize) {
+    use systemless::memory::MemoryBus;
+    request.done = true;
+    let ram = runner.bus().ram_size();
+    let start = request.start.min(ram);
+    let len = request.len.min(ram - start) as usize;
+    let bytes = runner.bus().read_bytes(start, len);
+    match std::fs::write(&request.path, &bytes) {
+        Ok(()) => eprintln!(
+            "[DUMP] {} bytes from ${:08X} -> {} at {} instructions",
+            bytes.len(),
+            start,
+            request.path,
+            total
+        ),
+        Err(error) => eprintln!("[DUMP] could not write {}: {}", request.path, error),
+    }
+}
+
 fn save_screenshot(runner: &FixtureRunner, num: usize) {
     let (_, _, scrn_width, scrn_height, _) = runner.dispatcher().screen_mode;
     let w = scrn_width as u32;
@@ -2627,6 +2692,7 @@ fn run_headless(
     let mut total: usize = 0;
     let mut last_screenshot = 0usize;
     let mut next_event = 0usize;
+    let mut memory_dump = memory_dump_request();
 
     while total < max_instructions {
         // Deliver everything the script has scheduled at or before this
@@ -2658,6 +2724,12 @@ fn run_headless(
         let (steps, running) = runner.run_steps(steps_to_run, None);
         total += steps;
 
+        if let Some(request) = memory_dump.as_mut() {
+            if !request.done && total >= request.at {
+                write_memory_dump(&runner, request, total);
+            }
+        }
+
         let screenshot_num = if screenshot_every == 0 {
             0
         } else {
@@ -2684,6 +2756,11 @@ fn run_headless(
     }
 
     eprintln!("[HEADLESS] Completed {} instructions", total);
+    if let Some(request) = memory_dump.as_mut() {
+        if !request.done {
+            write_memory_dump(&runner, request, total);
+        }
+    }
     save_store.sync_save_files_now(&mut runner);
     save_screenshot(&runner, 9999);
     // Measurement-only: prints nothing unless SYSTEMLESS_WAIT_STATS is set.
