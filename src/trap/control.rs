@@ -9280,7 +9280,7 @@ mod tests {
         bus.write_long(window_ptr + 140, ctrl_handle);
         // checkBoxProc, so the part code is inCheckBox (11) rather than the
         // fixed inButton that FindControl still answers.
-        disp.control_proc_ids.insert(ctrl_ptr, 1);
+        disp.control_manager.set_proc_id(ctrl_ptr, 1);
 
         arm_control_dispatch(&mut cpu, 0x0009, sp);
         bus.write_long(sp, out_part);
