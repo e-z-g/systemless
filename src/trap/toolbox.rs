@@ -19503,7 +19503,12 @@ mod tests {
         // indistinguishable to the guest -- the event is still described here,
         // and still delivered exactly once below.
         assert!(disp.event_queue.is_empty(), "EventAvail must not queue it");
-        assert!(!disp.sent_open_app_event, "nor spend the delivery attempt");
+        assert!(
+            !disp
+                .apple_event_launch_state
+                .is_open_application_event_sent(),
+            "nor spend the delivery attempt"
+        );
 
         // A following GetNextEvent still delivers it, exactly once.
         bus.write_long(sp, event_ptr);
@@ -19514,7 +19519,10 @@ mod tests {
         assert!(deliver.unwrap().is_ok());
         assert_eq!(bus.read_word(sp + 6), 0xFFFF);
         assert_eq!(bus.read_word(event_ptr), 23);
-        assert!(disp.sent_open_app_event);
+        assert!(
+            disp.apple_event_launch_state
+                .is_open_application_event_sent()
+        );
         assert!(disp.event_queue.is_empty());
     }
 
