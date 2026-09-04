@@ -1726,6 +1726,9 @@ pub(crate) struct RenderedTune {
     pub(crate) checksum: u32,
     pub(crate) volume_fixed: u32,
     pub(crate) time_scale: u32,
+    /// Whether these samples came from an installed MIDI file rather than the
+    /// tune the guest queued.
+    pub(crate) substituted: bool,
     pub(crate) samples: Vec<crate::sound::StereoSample>,
 }
 

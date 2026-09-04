@@ -1036,6 +1036,36 @@ fn force_button_true_at_pc() -> Option<u32> {
     })
 }
 
+/// Load a MIDI file installed in place of a tune, if there is one.
+///
+/// The library is a directory named by `SYSTEMLESS_TUNE_LIBRARY`, holding
+/// files named for the checksum of the tune they replace -- `1A2B3C4D.mid`.
+/// Naming them by content rather than by title keeps this free of any
+/// knowledge of a particular game: the host never has to be told what tune it
+/// is looking at, only whether something has been left for it.
+///
+/// A missing directory, a missing file, or a file that will not parse all
+/// mean the same thing here, which is that the game's own music plays.
+fn load_substitute_tune(checksum: u32) -> Option<crate::tune_player::DecodedTune> {
+    let directory = std::env::var_os("SYSTEMLESS_TUNE_LIBRARY")?;
+    let directory = std::path::Path::new(&directory);
+    for extension in ["mid", "midi"] {
+        let path = directory.join(format!("{checksum:08X}.{extension}"));
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if let Some(tune) = crate::tune_player::midi::decode_midi(&bytes) {
+            return Some(tune);
+        }
+        eprintln!(
+            "[TUNE] {} is not a Standard MIDI File this host can read; \
+             playing the game's own music",
+            path.display()
+        );
+    }
+    None
+}
+
 /// A cheap checksum over a tune stream, so a cached render is only reused for
 /// the same bytes. Not a hash with any strength claim -- it guards against the
 /// same address holding a different tune, not against a crafted collision.
@@ -1174,8 +1204,6 @@ impl super::TrapDispatcher {
                 if let Some(player) = self.tune_players.get(&instance) {
                     decoded.adopt_header_programs(&player.header_programs);
                 }
-                let duration_ms =
-                    crate::tune_player::units_to_ms(decoded.duration_units, time_scale);
                 if trace {
                     eprintln!(
                         "[TUNE] queue tick={} tune=${:08X} longs={} notes={} units={} scale={} duration={}ms spots={}",
@@ -1185,7 +1213,7 @@ impl super::TrapDispatcher {
                         decoded.notes.len(),
                         decoded.duration_units,
                         time_scale,
-                        duration_ms,
+                        crate::tune_player::units_to_ms(decoded.duration_units, time_scale),
                         spots
                     );
                 }
@@ -1193,27 +1221,58 @@ impl super::TrapDispatcher {
                     return;
                 }
                 let checksum = tune_stream_checksum(&words);
+
+                // A MIDI file installed for this tune replaces its notes. The
+                // game still decides which tune plays, when it starts and
+                // stops, and how loud it is; only the music is someone
+                // else's. Cythera's own music is better known from the
+                // community's transcriptions than from QuickTime's rendering
+                // of it, which is why this exists.
+                let substitute = load_substitute_tune(checksum);
+                let substituted = substitute.is_some();
+                let (decoded, render_scale) = match substitute {
+                    Some(tune) => {
+                        if trace {
+                            eprintln!(
+                                "[TUNE] substituting {:08X}.mid: {} notes, {} ms",
+                                checksum,
+                                tune.notes.len(),
+                                crate::tune_player::units_to_ms(
+                                    tune.duration_units,
+                                    crate::tune_player::midi::MIDI_TIME_SCALE
+                                )
+                            );
+                        }
+                        (tune, crate::tune_player::midi::MIDI_TIME_SCALE)
+                    }
+                    None => (decoded, time_scale),
+                };
+                let duration_ms =
+                    crate::tune_player::units_to_ms(decoded.duration_units, render_scale);
+
                 let cached = self.tune_players.get(&instance).and_then(|player| {
                     player.rendered.as_ref().filter(|rendered| {
                         rendered.tune_ptr == tune_ptr
                             && rendered.longs == words.len()
                             && rendered.checksum == checksum
                             && rendered.volume_fixed == volume
-                            && rendered.time_scale == time_scale
+                            && rendered.time_scale == render_scale
+                            && rendered.substituted == substituted
                     })
                 });
                 let samples = match cached {
                     Some(rendered) => rendered.samples.clone(),
                     None => {
                         let rendered =
-                            crate::tune_player::render_tune(&decoded, volume, time_scale);
+                            crate::tune_player::render_tune(&decoded, volume, render_scale);
                         if let Some(player) = self.tune_players.get_mut(&instance) {
                             player.rendered = Some(super::dispatch::RenderedTune {
                                 tune_ptr,
                                 longs: words.len(),
                                 checksum,
                                 volume_fixed: volume,
-                                time_scale,
+                                time_scale: render_scale,
+                                substituted,
                                 samples: rendered.clone(),
                             });
                         }
