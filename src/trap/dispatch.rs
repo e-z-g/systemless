@@ -1353,6 +1353,9 @@ impl TrapTableProfile {
 pub(crate) struct QueuedTuneSegment {
     pub(crate) tune_ptr: u32,
     pub(crate) duration_ticks: u32,
+    /// The rate these samples were made at. Synthesised tunes use the mixer's
+    /// own rate; a recording keeps whatever it was recorded at.
+    pub(crate) sample_rate: u32,
     pub(crate) samples: Vec<crate::sound::StereoSample>,
 }
 
@@ -1422,6 +1425,7 @@ mod tune_queue_tests {
         QueuedTuneSegment {
             tune_ptr,
             duration_ticks: ticks,
+            sample_rate: crate::sound::OUTPUT_RATE,
             samples: vec![crate::sound::StereoSample { left: 0xC0, right: 0xC0 }; 4],
         }
     }
@@ -1519,7 +1523,10 @@ impl TunePlayerState {
     ///
     /// Guest ticks wrap, so "has this tick arrived" is the same subtraction
     /// the Event Manager uses for due times rather than a plain comparison.
-    pub(crate) fn advance(&mut self, tick: u32) -> Option<Vec<crate::sound::StereoSample>> {
+    pub(crate) fn advance(
+        &mut self,
+        tick: u32,
+    ) -> Option<(Vec<crate::sound::StereoSample>, u32)> {
         if let Some(until) = self.head_until_tick {
             if tick.wrapping_sub(until) < 0x8000_0000 {
                 self.queue.pop_front();
@@ -1529,7 +1536,7 @@ impl TunePlayerState {
         if self.head_until_tick.is_none() {
             if let Some(head) = self.queue.front() {
                 self.head_until_tick = Some(tick.wrapping_add(head.duration_ticks.max(1)));
-                return Some(head.samples.clone());
+                return Some((head.samples.clone(), head.sample_rate));
             }
         }
         None

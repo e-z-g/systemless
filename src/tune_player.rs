@@ -1323,3 +1323,323 @@ mod midi_tests {
         assert!(samples.iter().any(|s| s.left != 0x80));
     }
 }
+
+/// Playing a recording in place of a tune.
+///
+/// A synthesiser cannot sound like a performance, and for music that someone
+/// has actually recorded there is no reason to make it try. A tune with a
+/// recording installed plays the recording; the application still chooses
+/// which tune, when it starts and stops, and how loud it is.
+///
+/// WAV rather than anything else because it needs no decoder: the bytes are
+/// already samples. Anything else converts first -- on a Mac, `afconvert -f
+/// WAVE -d LEI16 in.m4a out.wav`.
+pub(crate) mod wav {
+    use crate::sound::StereoSample;
+
+    /// The largest recording this will load. A minute of 44.1 kHz stereo is
+    /// about ten megabytes, and the longest of Cythera's tunes is three and a
+    /// half minutes.
+    pub(crate) const MAX_WAV_BYTES: usize = 64 * 1024 * 1024;
+
+    pub(crate) struct Recording {
+        pub(crate) samples: Vec<StereoSample>,
+        pub(crate) sample_rate: u32,
+    }
+
+    impl Recording {
+        pub(crate) fn duration_ms(&self) -> u32 {
+            if self.sample_rate == 0 {
+                return 0;
+            }
+            ((self.samples.len() as u64 * 1000) / u64::from(self.sample_rate))
+                .min(u64::from(u32::MAX)) as u32
+        }
+    }
+
+    fn u16le(bytes: &[u8], at: usize) -> Option<u16> {
+        Some(u16::from_le_bytes([
+            *bytes.get(at)?,
+            *bytes.get(at + 1)?,
+        ]))
+    }
+
+    fn u32le(bytes: &[u8], at: usize) -> Option<u32> {
+        Some(u32::from_le_bytes([
+            *bytes.get(at)?,
+            *bytes.get(at + 1)?,
+            *bytes.get(at + 2)?,
+            *bytes.get(at + 3)?,
+        ]))
+    }
+
+    /// Read a RIFF/WAVE file of uncompressed PCM.
+    ///
+    /// 8- and 16-bit are accepted, mono or stereo. Everything else is
+    /// refused rather than misread: a compressed WAV read as PCM is loud
+    /// noise, which is a worse failure than silence.
+    ///
+    /// The Sound Manager channel this ends up on carries unsigned 8-bit
+    /// samples, so a 16-bit recording is reduced to that. The rate is kept
+    /// and handed to the mixer, which resamples.
+    pub(crate) fn decode_wav(bytes: &[u8]) -> Option<Recording> {
+        if bytes.len() > MAX_WAV_BYTES || bytes.len() < 12 {
+            return None;
+        }
+        if bytes.get(0..4)? != b"RIFF" || bytes.get(8..12)? != b"WAVE" {
+            return None;
+        }
+
+        let mut format: Option<(u16, u16, u32, u16, usize, usize)> = None;
+        let mut data: Option<(usize, usize)> = None;
+        let mut at = 12usize;
+        // Walk the chunks rather than assuming fmt is first and data second;
+        // plenty of writers put LIST or fact between them.
+        while at + 8 <= bytes.len() {
+            let id = bytes.get(at..at + 4)?;
+            let size = u32le(bytes, at + 4)? as usize;
+            let body = at + 8;
+            if id == b"fmt " && size >= 16 {
+                format = Some((
+                    u16le(bytes, body)?,      // format tag
+                    u16le(bytes, body + 2)?,  // channels
+                    u32le(bytes, body + 4)?,  // sample rate
+                    u16le(bytes, body + 14)?, // bits per sample
+                    body,
+                    size,
+                ));
+            } else if id == b"data" {
+                data = Some((body, size.min(bytes.len().saturating_sub(body))));
+            }
+            // Chunks are padded to an even length.
+            at = body + size + (size & 1);
+        }
+
+        let (tag, channels, sample_rate, bits, fmt_at, fmt_size) = format?;
+        let (start, length) = data?;
+
+        // 1 is WAVE_FORMAT_PCM. 0xFFFE is WAVE_FORMAT_EXTENSIBLE, which is
+        // what macOS's afconvert writes and what most modern tools emit: the
+        // real format is a GUID at offset 24 of the chunk, whose first two
+        // bytes are the tag and whose remaining fourteen are a fixed suffix.
+        // Checking that suffix is what keeps this from reading some other
+        // extensible format as PCM and playing it as noise.
+        const PCM_GUID_SUFFIX: [u8; 14] = [
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+        ];
+        let effective_tag = if tag == 0xFFFE {
+            if fmt_size < 40 {
+                return None;
+            }
+            if bytes.get(fmt_at + 26..fmt_at + 40)? != PCM_GUID_SUFFIX {
+                return None;
+            }
+            u16le(bytes, fmt_at + 24)?
+        } else {
+            tag
+        };
+        if effective_tag != 1 || sample_rate == 0 || channels == 0 || channels > 2 {
+            return None;
+        }
+
+        let frames;
+        let mut samples = Vec::new();
+        match bits {
+            8 => {
+                // 8-bit WAV is already unsigned, the same convention the
+                // Sound Manager uses.
+                frames = length / usize::from(channels);
+                for frame in 0..frames {
+                    let base = start + frame * usize::from(channels);
+                    let left = *bytes.get(base)?;
+                    let right = if channels == 2 { *bytes.get(base + 1)? } else { left };
+                    samples.push(StereoSample { left, right });
+                }
+            }
+            16 => {
+                let stride = 2 * usize::from(channels);
+                frames = length / stride;
+                for frame in 0..frames {
+                    let base = start + frame * stride;
+                    let left = u16le(bytes, base)? as i16;
+                    let right = if channels == 2 {
+                        u16le(bytes, base + 2)? as i16
+                    } else {
+                        left
+                    };
+                    // Signed 16-bit to unsigned 8-bit.
+                    let to_byte = |value: i16| ((value >> 8) as i32 + 128).clamp(0, 255) as u8;
+                    samples.push(StereoSample {
+                        left: to_byte(left),
+                        right: to_byte(right),
+                    });
+                }
+            }
+            _ => return None,
+        }
+
+        if samples.is_empty() {
+            return None;
+        }
+        Some(Recording { samples, sample_rate })
+    }
+}
+
+#[cfg(test)]
+mod wav_tests {
+    use super::wav::*;
+
+    /// A RIFF/WAVE file of uncompressed PCM.
+    fn build(channels: u16, bits: u16, rate: u32, body: &[u8], tag: u16) -> Vec<u8> {
+        let block_align = channels * bits / 8;
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&tag.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&rate.to_le_bytes());
+        fmt.extend_from_slice(&(rate * u32::from(block_align)).to_le_bytes());
+        fmt.extend_from_slice(&block_align.to_le_bytes());
+        fmt.extend_from_slice(&bits.to_le_bytes());
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&0u32.to_le_bytes()); // size, unread
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+        out.extend_from_slice(&fmt);
+        // A chunk between fmt and data, which plenty of writers emit.
+        out.extend_from_slice(b"LIST");
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(b"INFO");
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn sixteen_bit_stereo_becomes_unsigned_eight_bit() {
+        // Three stereo frames, both channels the same in each: full
+        // positive, full negative, silence. Interleaved, so six values.
+        let body: Vec<u8> = [0x7FFFi16, 0x7FFF, -0x8000, -0x8000, 0, 0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let r = decode_wav(&build(2, 16, 44100, &body, 1)).expect("parses");
+        assert_eq!(r.sample_rate, 44100);
+        assert_eq!(r.samples.len(), 3);
+        assert_eq!(r.samples[0].left, 255, "full positive is full scale");
+        assert_eq!(r.samples[1].left, 0, "full negative is zero");
+        assert_eq!(r.samples[2].left, 128, "silence is the midpoint");
+    }
+
+    #[test]
+    fn mono_is_carried_to_both_channels() {
+        let body: Vec<u8> = [1000i16, -1000].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let r = decode_wav(&build(1, 16, 22050, &body, 1)).expect("parses");
+        assert_eq!(r.samples.len(), 2);
+        for s in &r.samples {
+            assert_eq!(s.left, s.right, "a mono recording sits in the middle");
+        }
+    }
+
+    #[test]
+    fn eight_bit_is_already_unsigned() {
+        let r = decode_wav(&build(2, 8, 22050, &[0, 255, 128, 128], 1)).expect("parses");
+        assert_eq!(r.samples.len(), 2);
+        assert_eq!((r.samples[0].left, r.samples[0].right), (0, 255));
+        assert_eq!((r.samples[1].left, r.samples[1].right), (128, 128));
+    }
+
+    #[test]
+    fn a_chunk_between_fmt_and_data_is_stepped_over() {
+        // The builder always writes a LIST chunk between them, so every test
+        // above covers this; this one says so out loud.
+        let body: Vec<u8> = [0i16; 4].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert!(decode_wav(&build(2, 16, 44100, &body, 1)).is_some());
+    }
+
+    /// WAVE_FORMAT_EXTENSIBLE, as afconvert and most modern tools write it:
+    /// a 40-byte fmt chunk whose real format is a GUID at offset 24.
+    fn build_extensible(channels: u16, bits: u16, rate: u32, body: &[u8], sub: u16,
+                        suffix: [u8; 14]) -> Vec<u8> {
+        let block_align = channels * bits / 8;
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        fmt.extend_from_slice(&channels.to_le_bytes());
+        fmt.extend_from_slice(&rate.to_le_bytes());
+        fmt.extend_from_slice(&(rate * u32::from(block_align)).to_le_bytes());
+        fmt.extend_from_slice(&block_align.to_le_bytes());
+        fmt.extend_from_slice(&bits.to_le_bytes());
+        fmt.extend_from_slice(&22u16.to_le_bytes());   // cbSize
+        fmt.extend_from_slice(&bits.to_le_bytes());    // valid bits
+        fmt.extend_from_slice(&3u32.to_le_bytes());    // channel mask
+        fmt.extend_from_slice(&sub.to_le_bytes());
+        fmt.extend_from_slice(&suffix);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+        out.extend_from_slice(&fmt);
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    const PCM_SUFFIX: [u8; 14] = [
+        0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71,
+    ];
+
+    #[test]
+    fn extensible_pcm_is_accepted_because_afconvert_writes_it() {
+        // Every recording converted on a Mac arrives in this form; refusing
+        // it meant no recording could be played at all.
+        let body: Vec<u8> = [0x7FFFi16, 0x7FFF].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let r = decode_wav(&build_extensible(2, 16, 44100, &body, 1, PCM_SUFFIX))
+            .expect("extensible PCM parses");
+        assert_eq!(r.sample_rate, 44100);
+        assert_eq!(r.samples[0].left, 255);
+    }
+
+    #[test]
+    fn an_extensible_wav_that_is_not_pcm_is_still_refused() {
+        let body: Vec<u8> = vec![0x40; 32];
+        // Sub-format 3 is IEEE float, which these samples are not.
+        assert!(decode_wav(&build_extensible(2, 16, 44100, &body, 3, PCM_SUFFIX)).is_none());
+        // A PCM tag with a foreign GUID suffix is some other format entirely.
+        let mut wrong = PCM_SUFFIX; wrong[0] = 0x99;
+        assert!(decode_wav(&build_extensible(2, 16, 44100, &body, 1, wrong)).is_none());
+    }
+
+    #[test]
+    fn a_compressed_wav_is_refused_rather_than_played_as_noise() {
+        // Format tag 0x11 is IMA ADPCM. Read as PCM it is loud noise, which
+        // is a worse failure than declining it.
+        let body: Vec<u8> = vec![0x40; 64];
+        assert!(decode_wav(&build(2, 4, 44100, &body, 0x11)).is_none());
+        // 24-bit PCM is honest PCM this decoder does not handle.
+        assert!(decode_wav(&build(2, 24, 44100, &body, 1)).is_none());
+    }
+
+    #[test]
+    fn rubbish_is_refused_and_nothing_panics() {
+        assert!(decode_wav(b"").is_none());
+        assert!(decode_wav(b"RIFF").is_none());
+        assert!(decode_wav(b"not a wav file at all").is_none());
+        let full = build(2, 16, 44100, &[0u8; 32], 1);
+        for cut in 0..full.len() {
+            let _ = decode_wav(&full[..cut]);
+        }
+    }
+
+    #[test]
+    fn duration_comes_from_the_frame_count_and_the_rate() {
+        let body: Vec<u8> = vec![0u8; 44100 * 4]; // one second of 16-bit stereo
+        let r = decode_wav(&build(2, 16, 44100, &body, 1)).expect("parses");
+        assert_eq!(r.duration_ms(), 1000);
+    }
+}

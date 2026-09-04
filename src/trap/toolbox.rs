@@ -1071,6 +1071,29 @@ fn load_substitute_tune(checksum: u32) -> Option<crate::tune_player::DecodedTune
     None
 }
 
+/// Load a recording installed in place of a tune, if there is one.
+///
+/// Looked for before the MIDI and before the tune's own notes, because a
+/// recording is a finished performance and neither of the others can be.
+/// Named the same way -- `1A2B3C4D.wav` -- so one library directory can hold
+/// recordings for some tunes and MIDI for others.
+fn load_substitute_recording(checksum: u32) -> Option<crate::tune_player::wav::Recording> {
+    let directory = std::env::var_os("SYSTEMLESS_TUNE_LIBRARY")?;
+    let path = std::path::Path::new(&directory).join(format!("{checksum:08X}.wav"));
+    let bytes = std::fs::read(&path).ok()?;
+    match crate::tune_player::wav::decode_wav(&bytes) {
+        Some(recording) => Some(recording),
+        None => {
+            eprintln!(
+                "[TUNE] {} is not uncompressed PCM this host can read; \
+                 convert it, for instance with: afconvert -f WAVE -d LEI16",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 /// A cheap checksum over a tune stream, so a cached render is only reused for
 /// the same bytes. Not a hash with any strength claim -- it guards against the
 /// same address holding a different tune, not against a crafted collision.
@@ -1233,6 +1256,31 @@ impl super::TrapDispatcher {
                 // else's. Cythera's own music is better known from the
                 // community's transcriptions than from QuickTime's rendering
                 // of it, which is why this exists.
+                // A recording, if one is installed, is played as it is; there
+                // is nothing for a synthesiser to add to a performance.
+                if let Some(recording) = load_substitute_recording(checksum) {
+                    let duration_ms = recording.duration_ms();
+                    if trace {
+                        eprintln!(
+                            "[TUNE] playing recording {:08X}.wav: {} frames at {} Hz, {} ms",
+                            checksum,
+                            recording.samples.len(),
+                            recording.sample_rate,
+                            duration_ms
+                        );
+                    }
+                    let ticks = duration_ms.saturating_mul(60) / 1000;
+                    if let Some(player) = self.tune_players.get_mut(&instance) {
+                        player.queue.push_back(super::dispatch::QueuedTuneSegment {
+                            tune_ptr,
+                            duration_ticks: ticks,
+                            sample_rate: recording.sample_rate,
+                            samples: recording.samples,
+                        });
+                    }
+                    self.start_due_tune_segment(instance, tick);
+                    return;
+                }
                 let substitute = load_substitute_tune(checksum);
                 let substituted = substitute.is_some();
                 let (decoded, render_scale) = match substitute {
@@ -1291,6 +1339,7 @@ impl super::TrapDispatcher {
                     player.queue.push_back(super::dispatch::QueuedTuneSegment {
                         tune_ptr,
                         duration_ticks,
+                        sample_rate: crate::sound::OUTPUT_RATE,
                         samples,
                     });
                 }
@@ -1336,8 +1385,8 @@ impl super::TrapDispatcher {
             .tune_players
             .get_mut(&instance)
             .and_then(|player| player.advance(tick));
-        if let Some(samples) = started {
-            self.sound_manager.play_tune_samples(instance, samples);
+        if let Some((samples, rate)) = started {
+            self.sound_manager.play_tune_samples(instance, samples, rate);
         }
     }
 
