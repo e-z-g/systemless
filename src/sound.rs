@@ -638,15 +638,18 @@ impl SoundManager {
     /// The component instance stands in for a guest `SndChannel` pointer: a
     /// tune player has no channel of its own, but it needs a distinct one so
     /// that stopping the music does not silence sound effects.
-    pub(crate) fn play_tune_samples(&mut self, instance: u32, samples: Vec<StereoSample>) {
+    pub(crate) fn play_tune_samples(
+        &mut self,
+        instance: u32,
+        samples: Vec<StereoSample>,
+        sample_rate: u32,
+    ) {
         let channel = self.ensure_channel_mut(instance);
         channel.quiet();
-        channel.play_stereo_buffer(
-            samples,
-            (OUTPUT_RATE << 16) as u32,
-            PlaybackKind::Buffer,
-            0,
-        );
+        // The mixer resamples, so a recording keeps its own rate rather than
+        // being converted here.
+        let rate = if sample_rate == 0 { OUTPUT_RATE } else { sample_rate };
+        channel.play_stereo_buffer(samples, rate << 16, PlaybackKind::Buffer, 0);
     }
 
     /// Silence a tune player's channel, for `TuneStop` and `CloseComponent`.
@@ -1289,7 +1292,7 @@ mod tests {
             StereoSample { left: 0xFF, right: 0x00 },
             StereoSample { left: 0x00, right: 0xFF },
         ];
-        manager.play_tune_samples(instance, samples);
+        manager.play_tune_samples(instance, samples, OUTPUT_RATE);
 
         let mixed = manager.mix_frame_stereo_frames(4);
         assert!(
@@ -1304,8 +1307,8 @@ mod tests {
         let tune = 0x00C1_0001;
         let effect = 0x0009_0000;
         let loud = vec![StereoSample { left: 0xFF, right: 0xFF }; 4];
-        manager.play_tune_samples(tune, loud.clone());
-        manager.play_tune_samples(effect, loud);
+        manager.play_tune_samples(tune, loud.clone(), OUTPUT_RATE);
+        manager.play_tune_samples(effect, loud, OUTPUT_RATE);
 
         manager.stop_tune_channel(tune);
 
