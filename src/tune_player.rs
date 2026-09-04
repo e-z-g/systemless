@@ -78,8 +78,24 @@ const MARKER_EVENT_END: u32 = 0;
 const GENERAL_EVENT_NOTE_REQUEST: u32 = 1;
 
 /// QTMA controller numbers, which are *not* MIDI controller numbers.
+/// `QuickTimeMusic.h`; the readings of each are delvmod's, in `delv/sound.py`,
+/// which is the only other implementation of this decode.
+const CONTROLLER_MODULATION: u32 = 1;
 const CONTROLLER_VOLUME: u32 = 7;
+const CONTROLLER_PAN: u32 = 10;
+const CONTROLLER_PITCH_BEND: u32 = 32;
+const CONTROLLER_AFTERTOUCH: u32 = 33;
+const CONTROLLER_SUSTAIN: u32 = 64;
 const CONTROLLER_PART_VOLUME: u32 = 42;
+
+/// Extended control events, eight bytes, with a wider part and controller.
+const X_CONTROL_EVENT_TYPE: u32 = 0xA;
+/// In the second long: the top two bits are the length field, then a
+/// fourteen-bit controller, then a sixteen-bit value.
+const X_CONTROL_CONTROLLER_POS: u32 = 16;
+const X_CONTROL_CONTROLLER_WIDTH: u32 = 14;
+const X_CONTROL_VALUE_POS: u32 = 0;
+const X_CONTROL_VALUE_WIDTH: u32 = 16;
 
 /// The longest stream this will walk, in longs. A tune is a guest pointer with
 /// no length, terminated by an end marker; a corrupt or unterminated stream
@@ -97,6 +113,12 @@ const MAX_RENDER_SECONDS: u32 = 300;
 pub(crate) fn units_to_ms(units: u32, time_scale: u32) -> u32 {
     let scale = if time_scale == 0 { 600 } else { time_scale };
     ((u64::from(units) * 1000) / u64::from(scale)).min(u64::from(u32::MAX)) as u32
+}
+
+/// Convert milliseconds back to the tune's time-scale units.
+pub(crate) fn ms_to_units(ms: u32, time_scale: u32) -> u32 {
+    let scale = if time_scale == 0 { 600 } else { time_scale };
+    ((u64::from(ms) * u64::from(scale)) / 1000).min(u64::from(u32::MAX)) as u32
 }
 
 fn extract(value: u32, pos: u32, width: u32) -> u32 {
@@ -138,14 +160,56 @@ pub(crate) struct TuneNote {
     pub(crate) volume: u8,
 }
 
-/// A decoded tune: its notes, how long it runs, and the General MIDI program
-/// each part asked for through its note request.
+/// One controller value taking effect on one part at one moment.
+///
+/// Controllers are what carry a performance: the notes say which keys were
+/// pressed, and these say how. They are kept as a timeline rather than a
+/// final value because they change during a piece, and often during a note.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ControlPoint {
+    pub(crate) at_units: u32,
+    pub(crate) part: u8,
+    pub(crate) value: f32,
+}
+
+/// Every controller stream this decoder understands, per part, in time order.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Controllers {
+    /// Part volume, 8.8 fixed, where 1.0 is unity.
+    pub(crate) volume: Vec<ControlPoint>,
+    /// Stereo position, 0 hard left to 127 hard right, 64 centre.
+    pub(crate) pan: Vec<ControlPoint>,
+    /// Modulation depth, 8.8 fixed. Drives vibrato.
+    pub(crate) modulation: Vec<ControlPoint>,
+    /// Pitch bend, in semitones.
+    pub(crate) pitch_bend: Vec<ControlPoint>,
+    /// Channel pressure, 0 to 127.
+    pub(crate) pressure: Vec<ControlPoint>,
+    /// Damper pedal, non-zero for down. Holds a note past its written end.
+    pub(crate) sustain: Vec<ControlPoint>,
+}
+
+impl Controllers {
+    /// The value in force for a part at a moment, or `default` if the part
+    /// has said nothing yet.
+    fn value_at(points: &[ControlPoint], part: u8, at_units: u32, default: f32) -> f32 {
+        points
+            .iter()
+            .filter(|point| point.part == part && point.at_units <= at_units)
+            .last()
+            .map_or(default, |point| point.value)
+    }
+}
+
+/// A decoded tune: its notes, how long it runs, the General MIDI program each
+/// part asked for through its note request, and the controllers that shape
+/// the performance.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DecodedTune {
     pub(crate) notes: Vec<TuneNote>,
     pub(crate) duration_units: u32,
     pub(crate) programs: Vec<(u8, u8)>,
-    pub(crate) part_volume: Vec<(u8, u8)>,
+    pub(crate) controllers: Controllers,
 }
 
 impl DecodedTune {
@@ -171,12 +235,7 @@ impl DecodedTune {
             .map_or(0, |(_, program)| *program)
     }
 
-    fn volume_for(&self, part: u8) -> u8 {
-        self.part_volume
-            .iter()
-            .find(|(p, _)| *p == part)
-            .map_or(100, |(_, volume)| *volume)
-    }
+
 }
 
 /// The General MIDI program a note request asks for.
@@ -196,6 +255,76 @@ fn note_request_gm_number(payload: &[u32]) -> Option<u8> {
         Some(gm.min(127) as u8)
     } else {
         None
+    }
+}
+
+/// File one controller event onto the right timeline.
+///
+/// The readings here follow delvmod's `delv/sound.py`, which is the only
+/// other decoder of this format. Where it calls something an approximation,
+/// so is this.
+fn record_controller(
+    controllers: &mut Controllers,
+    at_units: u32,
+    part: u8,
+    controller: u32,
+    value: u32,
+) {
+    // Volume and modulation arrive as 8.8 fixed point in the value word.
+    let fixed_8_8 = |raw: u32| (raw >> 8) as f32 + ((raw & 0xFF) as f32 / 256.0);
+
+    let point = |value: f32| ControlPoint {
+        at_units,
+        part,
+        value,
+    };
+
+    match controller {
+        CONTROLLER_VOLUME | CONTROLLER_PART_VOLUME => {
+            controllers.volume.push(point(fixed_8_8(value)));
+        }
+        CONTROLLER_MODULATION => {
+            controllers.modulation.push(point(fixed_8_8(value)));
+        }
+        CONTROLLER_PAN => {
+            // QTMA carries pan as 256 (hard left) to 512 (hard right);
+            // delvmod scales it to the MIDI 0..127 range and clamps.
+            let scaled = (value as i64 - 256) / 2;
+            controllers
+                .pan
+                .push(point(scaled.clamp(0, 127) as f32));
+        }
+        CONTROLLER_PITCH_BEND => {
+            // QTMA stores bend as two seven-bit fields of fractional
+            // semitones, and the mapping is not documented. delvmod's
+            // reading, arrived at against known tracks and labelled a hack
+            // there, is followed exactly: treat the low seven bits as the
+            // magnitude, and take a non-zero second field to mean the bend
+            // is negative. Cythera's bends are small fractions of a
+            // semitone, so the approximation is inaudible either way.
+            let magnitude = (value & 0x7F) as f32;
+            let sign_field = (value >> 8) & 0x7F;
+            let midi_units = if sign_field != 0 {
+                (magnitude - 127.0) * 7.4
+            } else {
+                magnitude
+            };
+            // A MIDI bend of 8,192 units is conventionally two semitones.
+            controllers
+                .pitch_bend
+                .push(point(midi_units / 8192.0 * 2.0));
+        }
+        CONTROLLER_AFTERTOUCH => {
+            controllers.pressure.push(point((value & 0x7F) as f32));
+        }
+        CONTROLLER_SUSTAIN => {
+            controllers
+                .sustain
+                .push(point(if value > 0 { 1.0 } else { 0.0 }));
+        }
+        // Reverb and the rest are decoded by delvmod and not modelled here;
+        // this synthesiser has no effects to send them to.
+        _ => {}
     }
 }
 
@@ -245,16 +374,18 @@ pub(crate) fn decode_tune(words: &[u32]) -> DecodedTune {
                 });
             }
             CONTROL_EVENT_TYPE => {
+                let part = extract(word, EVENT_PART_POS, EVENT_PART_WIDTH) as u8;
                 let controller = extract(word, CONTROL_CONTROLLER_POS, CONTROL_CONTROLLER_WIDTH);
-                if controller == CONTROLLER_VOLUME || controller == CONTROLLER_PART_VOLUME {
-                    let part = extract(word, EVENT_PART_POS, EVENT_PART_WIDTH) as u8;
-                    // Controller values are 16-bit with the useful range in the
-                    // high byte; MIDI-style 0..127 is the low seven bits of it.
-                    let value = extract(word, CONTROL_VALUE_POS, CONTROL_VALUE_WIDTH);
-                    let scaled = ((value >> 8) & 0x7F) as u8;
-                    tune.part_volume.retain(|(p, _)| *p != part);
-                    tune.part_volume.push((part, scaled));
-                }
+                let value = extract(word, CONTROL_VALUE_POS, CONTROL_VALUE_WIDTH);
+                record_controller(&mut tune.controllers, now_units, part, controller, value);
+            }
+            X_CONTROL_EVENT_TYPE if length >= 2 => {
+                let second = words[index + 1];
+                let part = extract(word, X_EVENT_PART_POS, X_EVENT_PART_WIDTH) as u8;
+                let controller =
+                    extract(second, X_CONTROL_CONTROLLER_POS, X_CONTROL_CONTROLLER_WIDTH);
+                let value = extract(second, X_CONTROL_VALUE_POS, X_CONTROL_VALUE_WIDTH);
+                record_controller(&mut tune.controllers, now_units, part, controller, value);
             }
             MARKER_EVENT_TYPE => {
                 let subtype = extract(word, MARKER_SUBTYPE_POS, MARKER_SUBTYPE_WIDTH);
@@ -382,7 +513,9 @@ pub(crate) fn render_tune(
     if frames == 0 {
         return Vec::new();
     }
-    let mut buffer = vec![0.0f32; frames];
+    // Left and right are kept apart from here so that pan is real stereo
+    // rather than the same signal twice.
+    let mut buffer = vec![(0.0f32, 0.0f32); frames];
 
     for note in &tune.notes {
         let frequency = pitch_hz(note.pitch);
@@ -409,14 +542,42 @@ pub(crate) fn render_tune(
         let program = tune.program_for(note.part);
         let (harmonics, voicing) = timbre(program);
         let harmonic_sum: f32 = harmonics.iter().sum::<f32>().max(1e-6);
-        let sustain_frames = ((duration_ms as f32 / 1000.0) * rate) as usize;
+        let mut sustain_frames = ((duration_ms as f32 / 1000.0) * rate) as usize;
         // A sung note starts far more gently than a struck one.
         let attack_seconds = if voicing == Voicing::Vocal { 0.045 } else { 0.008 };
         let attack = ((attack_seconds * rate) as usize).max(1);
-        let part_volume = f32::from(tune.volume_for(note.part)) / 127.0;
+
+        // Controllers in force where this note begins. Volume, pan, pressure
+        // and the damper move slowly enough that reading them once at the
+        // start is faithful; bend and modulation are read per frame below,
+        // because their whole purpose is to move during a note.
+        let controls = &tune.controllers;
+        let part_volume =
+            Controllers::value_at(&controls.volume, note.part, note.start_units, 1.0);
+        let pan = Controllers::value_at(&controls.pan, note.part, note.start_units, 64.0);
+        let pressure =
+            Controllers::value_at(&controls.pressure, note.part, note.start_units, 0.0);
+        let damped =
+            Controllers::value_at(&controls.sustain, note.part, note.start_units, 0.0) > 0.5;
+        if damped {
+            // The pedal holds a note until it is lifted; without tracking the
+            // lift, hold it through the tail that is already rendered.
+            sustain_frames = length;
+        }
+
+        // Equal-power panning, so moving a part across the image does not
+        // change how loud it is.
+        let pan_angle = (pan / 127.0).clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2;
+        let (left_gain, right_gain) = (pan_angle.cos(), pan_angle.sin());
+
         let master = (volume_fixed as f32 / 65536.0).clamp(0.0, 1.0);
-        let gain =
-            (f32::from(note.volume) / 127.0) * (0.4 + 0.6 * part_volume) * 0.28 * master;
+        // Aftertouch leans on the note rather than replacing its velocity.
+        let pressure_gain = 1.0 + (pressure / 127.0) * 0.35;
+        let gain = (f32::from(note.volume) / 127.0)
+            * (0.4 + 0.6 * part_volume.clamp(0.0, 2.0))
+            * pressure_gain
+            * 0.28
+            * master;
         if gain <= 0.0 {
             continue;
         }
@@ -439,16 +600,37 @@ pub(crate) fn render_tune(
         }
 
         for frame in 0..length {
-            // A slow, shallow vibrato, faded in over the first moments of the
-            // note the way a singer does rather than applied from the attack.
-            let vibrato = if voicing == Voicing::Vocal {
-                let seconds = frame as f32 / rate;
-                let depth = 0.006 * (seconds / 0.25).min(1.0);
+            let seconds = frame as f32 / rate;
+            let now_units = note
+                .start_units
+                .saturating_add(ms_to_units((seconds * 1000.0) as u32, time_scale));
+
+            // Vibrato has two sources: a sung part carries its own, and the
+            // modulation wheel asks for it on any part. They add.
+            let modulation =
+                Controllers::value_at(&controls.modulation, note.part, now_units, 0.0);
+            let own_depth = if voicing == Voicing::Vocal {
+                0.006 * (seconds / 0.25).min(1.0)
+            } else {
+                0.0
+            };
+            let depth = own_depth + (modulation.clamp(0.0, 1.0) * 0.02);
+            let vibrato = if depth > 0.0 {
                 let phase = (seconds * VIBRATO_HZ * SINE_TABLE_LEN as f32) as usize;
                 1.0 + depth * table[phase & (SINE_TABLE_LEN - 1)]
             } else {
                 1.0
             };
+
+            // Pitch bend, in semitones, applied as a frequency ratio.
+            let bend =
+                Controllers::value_at(&controls.pitch_bend, note.part, now_units, 0.0);
+            let bend_ratio = if bend == 0.0 {
+                1.0
+            } else {
+                2.0f32.powf(bend / 12.0)
+            };
+            let vibrato = vibrato * bend_ratio;
             let mut sample = 0.0f32;
             for index in 0..partials {
                 let position = phase[index] as usize & (SINE_TABLE_LEN - 1);
@@ -478,24 +660,29 @@ pub(crate) fn render_tune(
                 envelope
             };
 
-            buffer[start + frame] += sample * envelope * gain;
+            let value = sample * envelope * gain;
+            buffer[start + frame].0 += value * left_gain;
+            buffer[start + frame].1 += value * right_gain;
         }
     }
 
     // Normalise to just under full scale so a dense tune does not clip and a
-    // sparse one is still audible.
-    let peak = buffer.iter().fold(0.0f32, |acc, s| acc.max(s.abs()));
+    // sparse one is still audible. Both channels share one scale, or panning
+    // would shift the balance.
+    let peak = buffer
+        .iter()
+        .fold(0.0f32, |acc, (l, r)| acc.max(l.abs()).max(r.abs()));
     let scale = if peak > 0.0 { 0.89 / peak } else { 0.0 };
+    let to_byte = |sample: f32| {
+        let scaled = (sample * scale).clamp(-1.0, 1.0);
+        (scaled * 127.0 + 128.0).round().clamp(0.0, 255.0) as u8
+    };
 
     buffer
         .into_iter()
-        .map(|sample| {
-            let scaled = (sample * scale).clamp(-1.0, 1.0);
-            let byte = (scaled * 127.0 + 128.0).round().clamp(0.0, 255.0) as u8;
-            StereoSample {
-                left: byte,
-                right: byte,
-            }
+        .map(|(left, right)| StereoSample {
+            left: to_byte(left),
+            right: to_byte(right),
         })
         .collect()
 }
@@ -613,6 +800,129 @@ mod tests {
         let tune = decode_tune(&words);
         assert_eq!(tune.notes.len(), 0);
         assert_eq!(tune.duration_units, 0);
+    }
+
+    fn control(part: u32, controller: u32, value: u32) -> u32 {
+        (CONTROL_EVENT_TYPE << EVENT_TYPE_POS)
+            | (part << EVENT_PART_POS)
+            | (controller << CONTROL_CONTROLLER_POS)
+            | value
+    }
+
+    #[test]
+    fn pan_places_a_part_in_the_stereo_image() {
+        // QTMA pan runs 256 hard left to 512 hard right. Without this the
+        // renderer emitted the same signal to both channels and every part
+        // sat in the middle.
+        let hard_left = [
+            control(0, CONTROLLER_PAN, 256),
+            note(0, 60, 127, 500),
+            END_MARKER_VALUE,
+        ];
+        let tune = decode_tune(&hard_left);
+        assert_eq!(tune.controllers.pan.len(), 1);
+        assert_eq!(tune.controllers.pan[0].value, 0.0);
+        let samples = render_tune(&tune, 0x0001_0000, 600);
+        let left: i32 = samples.iter().map(|s| (s.left as i32 - 128).abs()).sum();
+        let right: i32 = samples.iter().map(|s| (s.right as i32 - 128).abs()).sum();
+        assert!(left > right * 4, "hard left: left={left} right={right}");
+    }
+
+    #[test]
+    fn pan_is_symmetric() {
+        let right_side = [
+            control(0, CONTROLLER_PAN, 512),
+            note(0, 60, 127, 500),
+            END_MARKER_VALUE,
+        ];
+        let tune = decode_tune(&right_side);
+        assert_eq!(tune.controllers.pan[0].value, 127.0);
+        let samples = render_tune(&tune, 0x0001_0000, 600);
+        let left: i32 = samples.iter().map(|s| (s.left as i32 - 128).abs()).sum();
+        let right: i32 = samples.iter().map(|s| (s.right as i32 - 128).abs()).sum();
+        assert!(right > left * 4, "hard right: left={left} right={right}");
+    }
+
+    #[test]
+    fn volume_and_modulation_are_eight_eight_fixed_point() {
+        // 0x0180 is 1.5, not 384.
+        let words = [
+            control(0, CONTROLLER_VOLUME, 0x0180),
+            control(0, CONTROLLER_MODULATION, 0x0080),
+            END_MARKER_VALUE,
+        ];
+        let tune = decode_tune(&words);
+        assert_eq!(tune.controllers.volume[0].value, 1.5);
+        assert_eq!(tune.controllers.modulation[0].value, 0.5);
+    }
+
+    #[test]
+    fn a_controller_timeline_keeps_every_change_in_order() {
+        // Controllers move during a piece; keeping only the last value would
+        // apply the end of a fade to its beginning.
+        let words = [
+            control(0, CONTROLLER_VOLUME, 0x0100),
+            rest(600),
+            control(0, CONTROLLER_VOLUME, 0x0080),
+            END_MARKER_VALUE,
+        ];
+        let tune = decode_tune(&words);
+        assert_eq!(tune.controllers.volume.len(), 2);
+        assert_eq!(tune.controllers.volume[0].at_units, 0);
+        assert_eq!(tune.controllers.volume[1].at_units, 600);
+        assert_eq!(
+            Controllers::value_at(&tune.controllers.volume, 0, 599, 1.0),
+            1.0
+        );
+        assert_eq!(
+            Controllers::value_at(&tune.controllers.volume, 0, 600, 1.0),
+            0.5
+        );
+    }
+
+    #[test]
+    fn aftertouch_and_the_damper_are_decoded() {
+        let words = [
+            control(0, CONTROLLER_AFTERTOUCH, 64),
+            control(0, CONTROLLER_SUSTAIN, 1),
+            END_MARKER_VALUE,
+        ];
+        let tune = decode_tune(&words);
+        assert_eq!(tune.controllers.pressure[0].value, 64.0);
+        assert_eq!(tune.controllers.sustain[0].value, 1.0);
+    }
+
+    #[test]
+    fn pitch_bend_follows_delvmods_reading_and_stays_small() {
+        // Cythera's bends are fractions of a semitone; a reading that made
+        // them whole semitones would be audibly out of tune.
+        let words = [control(0, CONTROLLER_PITCH_BEND, 40), END_MARKER_VALUE];
+        let tune = decode_tune(&words);
+        let bend = tune.controllers.pitch_bend[0].value;
+        assert!(bend.abs() < 0.5, "bend of {bend} semitones is too large");
+    }
+
+    #[test]
+    fn an_extended_control_event_records_the_same_way() {
+        let words = [
+            (2u32 << EVENT_LENGTH_POS)
+                | (X_CONTROL_EVENT_TYPE << X_EVENT_TYPE_POS)
+                | (3 << X_EVENT_PART_POS),
+            // Length field 2 in the top bits, as delvmod's validity check
+            // requires, then the controller and the value.
+            (2u32 << EVENT_LENGTH_POS)
+                | (CONTROLLER_PAN << X_CONTROL_CONTROLLER_POS)
+                | 512,
+            END_MARKER_VALUE,
+        ];
+        let tune = decode_tune(&words);
+        let point = tune
+            .controllers
+            .pan
+            .iter()
+            .find(|point| point.part == 3)
+            .expect("the extended form records against its own part");
+        assert_eq!(point.value, 127.0, "512 is hard right in either form");
     }
 
     #[test]
@@ -902,7 +1212,15 @@ pub(crate) mod midi {
             });
         }
         tune.programs = programs;
-        tune.part_volume = channel_volume;
+        // A MIDI channel volume is 0..127 where the QTMA one is a gain.
+        tune.controllers.volume = channel_volume
+            .into_iter()
+            .map(|(channel, volume)| super::ControlPoint {
+                at_units: 0,
+                part: channel,
+                value: f32::from(volume) / 100.0,
+            })
+            .collect();
         tune.duration_units = tune
             .notes
             .iter()
