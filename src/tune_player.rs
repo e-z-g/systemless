@@ -662,3 +662,346 @@ mod tests {
         assert!(samples.iter().all(|s| s.left == 0x80 && s.right == 0x80));
     }
 }
+
+/// Standard MIDI File support, so a tune can be played from a MIDI file in
+/// place of the QTMA stream the game queued.
+///
+/// This exists because Cythera's music is more widely known from the
+/// community's MIDI transcriptions than from QuickTime's rendering of the
+/// original; substituting at this level keeps the game in charge of *which*
+/// music plays and when, and replaces only the notes.
+pub(crate) mod midi {
+    use super::{DecodedTune, TuneNote};
+
+    /// A MIDI file's times are in ticks against a tempo map. Converting to
+    /// milliseconds and reporting a scale of 1000 lets the rest of the player
+    /// treat a MIDI tune exactly like a QTMA one.
+    pub(crate) const MIDI_TIME_SCALE: u32 = 1000;
+
+    /// The largest file this will parse, as a guard on a caller-supplied path.
+    pub(crate) const MAX_MIDI_BYTES: usize = 8 * 1024 * 1024;
+
+    struct Reader<'a> {
+        data: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> Reader<'a> {
+        fn u8(&mut self) -> Option<u8> {
+            let byte = *self.data.get(self.pos)?;
+            self.pos += 1;
+            Some(byte)
+        }
+
+        fn u16(&mut self) -> Option<u16> {
+            Some(u16::from_be_bytes([self.u8()?, self.u8()?]))
+        }
+
+        fn u32(&mut self) -> Option<u32> {
+            Some(u32::from_be_bytes([
+                self.u8()?,
+                self.u8()?,
+                self.u8()?,
+                self.u8()?,
+            ]))
+        }
+
+        /// A MIDI variable-length quantity: seven bits per byte, high bit set
+        /// on every byte but the last.
+        fn vlq(&mut self) -> Option<u32> {
+            let mut value: u32 = 0;
+            for _ in 0..4 {
+                let byte = self.u8()?;
+                value = (value << 7) | u32::from(byte & 0x7F);
+                if byte & 0x80 == 0 {
+                    return Some(value);
+                }
+            }
+            None
+        }
+    }
+
+    /// One note as it appears in the file, before tempo is applied.
+    struct TickNote {
+        start_tick: u64,
+        end_tick: u64,
+        channel: u8,
+        pitch: u8,
+        velocity: u8,
+    }
+
+    /// Parse a Standard MIDI File into the same shape a QTMA stream decodes
+    /// to, with times in milliseconds.
+    ///
+    /// Format 0 and format 1 are both handled by merging every track onto one
+    /// timeline; a MIDI channel becomes a part. SMPTE division is rejected
+    /// rather than guessed at.
+    pub(crate) fn decode_midi(bytes: &[u8]) -> Option<DecodedTune> {
+        if bytes.len() > MAX_MIDI_BYTES {
+            return None;
+        }
+        let mut reader = Reader { data: bytes, pos: 0 };
+        if bytes.get(0..4)? != b"MThd" {
+            return None;
+        }
+        reader.pos = 4;
+        let header_length = reader.u32()?;
+        if header_length < 6 {
+            return None;
+        }
+        let _format = reader.u16()?;
+        let track_count = reader.u16()?;
+        let division = reader.u16()?;
+        // A negative division is SMPTE timecode, a different clock entirely.
+        if division & 0x8000 != 0 || division == 0 {
+            return None;
+        }
+        let ticks_per_quarter = u64::from(division);
+        reader.pos = 8 + header_length as usize;
+
+        let mut notes: Vec<TickNote> = Vec::new();
+        let mut programs: Vec<(u8, u8)> = Vec::new();
+        let mut channel_volume: Vec<(u8, u8)> = Vec::new();
+        // (tick, microseconds per quarter note), always starting at 120 bpm.
+        let mut tempo_map: Vec<(u64, u32)> = vec![(0, 500_000)];
+
+        for _ in 0..track_count {
+            if reader.pos + 8 > bytes.len() {
+                break;
+            }
+            if bytes.get(reader.pos..reader.pos + 4)? != b"MTrk" {
+                break;
+            }
+            reader.pos += 4;
+            let track_length = reader.u32()? as usize;
+            let track_end = (reader.pos + track_length).min(bytes.len());
+
+            let mut tick: u64 = 0;
+            let mut running_status: Option<u8> = None;
+            let mut active: Vec<(u8, u8, u64, u8)> = Vec::new();
+
+            while reader.pos < track_end {
+                let delta = reader.vlq()?;
+                tick += u64::from(delta);
+                let mut status = *bytes.get(reader.pos)?;
+                if status & 0x80 != 0 {
+                    reader.pos += 1;
+                    running_status = Some(status);
+                } else {
+                    status = running_status?;
+                }
+
+                match status {
+                    0xFF => {
+                        let meta = reader.u8()?;
+                        let length = reader.vlq()? as usize;
+                        let payload = bytes.get(reader.pos..reader.pos + length)?;
+                        reader.pos += length;
+                        // Set Tempo.
+                        if meta == 0x51 && payload.len() == 3 {
+                            let micros = (u32::from(payload[0]) << 16)
+                                | (u32::from(payload[1]) << 8)
+                                | u32::from(payload[2]);
+                            if micros > 0 {
+                                tempo_map.push((tick, micros));
+                            }
+                        }
+                        // End of Track.
+                        if meta == 0x2F {
+                            break;
+                        }
+                    }
+                    // System exclusive: skip its declared length.
+                    0xF0 | 0xF7 => {
+                        let length = reader.vlq()? as usize;
+                        reader.pos = (reader.pos + length).min(track_end);
+                    }
+                    _ => {
+                        let kind = status & 0xF0;
+                        let channel = status & 0x0F;
+                        match kind {
+                            // Program Change and Channel Pressure take one byte.
+                            0xC0 | 0xD0 => {
+                                let value = reader.u8()?;
+                                if kind == 0xC0 {
+                                    programs.retain(|(c, _)| *c != channel);
+                                    programs.push((channel, value & 0x7F));
+                                }
+                            }
+                            _ => {
+                                let first = reader.u8()?;
+                                let second = reader.u8()?;
+                                match kind {
+                                    0x90 if second > 0 => {
+                                        active.push((channel, first, tick, second));
+                                    }
+                                    0x80 | 0x90 => {
+                                        if let Some(index) = active.iter().rposition(|entry| {
+                                            entry.0 == channel && entry.1 == first
+                                        }) {
+                                            let (_, pitch, start, velocity) = active.remove(index);
+                                            notes.push(TickNote {
+                                                start_tick: start,
+                                                end_tick: tick,
+                                                channel,
+                                                pitch,
+                                                velocity,
+                                            });
+                                        }
+                                    }
+                                    // Channel Volume.
+                                    0xB0 if first == 7 => {
+                                        channel_volume.retain(|(c, _)| *c != channel);
+                                        channel_volume.push((channel, second & 0x7F));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            reader.pos = track_end;
+        }
+
+        if notes.is_empty() {
+            return None;
+        }
+
+        tempo_map.sort_by_key(|(tick, _)| *tick);
+        let to_ms = |tick: u64| -> u32 {
+            let mut millis = 0f64;
+            let mut last_tick = 0u64;
+            let mut last_tempo = tempo_map[0].1;
+            for (at, tempo) in tempo_map.iter().skip(1) {
+                if *at >= tick {
+                    break;
+                }
+                millis += (at - last_tick) as f64 / ticks_per_quarter as f64
+                    * (f64::from(last_tempo) / 1000.0);
+                last_tick = *at;
+                last_tempo = *tempo;
+            }
+            millis += (tick - last_tick) as f64 / ticks_per_quarter as f64
+                * (f64::from(last_tempo) / 1000.0);
+            millis.max(0.0).min(f64::from(u32::MAX)) as u32
+        };
+
+        let mut tune = DecodedTune::default();
+        for note in &notes {
+            let start = to_ms(note.start_tick);
+            let end = to_ms(note.end_tick.max(note.start_tick));
+            tune.notes.push(TuneNote {
+                start_units: start,
+                // A zero-length note would be inaudible; give it the shortest
+                // duration the renderer can still shape an envelope over.
+                duration_units: end.saturating_sub(start).max(20),
+                part: note.channel,
+                pitch: note.pitch,
+                volume: note.velocity,
+            });
+        }
+        tune.programs = programs;
+        tune.part_volume = channel_volume;
+        tune.duration_units = tune
+            .notes
+            .iter()
+            .map(|note| note.start_units.saturating_add(note.duration_units))
+            .max()
+            .unwrap_or(0);
+        Some(tune)
+    }
+}
+
+#[cfg(test)]
+mod midi_tests {
+    use super::midi::*;
+    use super::*;
+
+    /// Build a one-track Standard MIDI File: a middle C held for one beat.
+    fn one_note_file(division: u16, tempo_micros: Option<u32>) -> Vec<u8> {
+        let mut track: Vec<u8> = Vec::new();
+        if let Some(micros) = tempo_micros {
+            track.extend_from_slice(&[0x00, 0xFF, 0x51, 0x03]);
+            track.extend_from_slice(&micros.to_be_bytes()[1..]);
+        }
+        // Program change on channel 0 to General MIDI 54.
+        track.extend_from_slice(&[0x00, 0xC0, 54]);
+        // Note on, then note off a whole division later.
+        track.extend_from_slice(&[0x00, 0x90, 60, 100]);
+        track.push(0x81);
+        track.push(0x48); // delta of 200 as a variable-length quantity
+        track.extend_from_slice(&[0x80, 60, 0]);
+        track.extend_from_slice(&[0x00, 0xFF, 0x2F, 0x00]);
+
+        let mut file: Vec<u8> = Vec::new();
+        file.extend_from_slice(b"MThd");
+        file.extend_from_slice(&6u32.to_be_bytes());
+        file.extend_from_slice(&0u16.to_be_bytes());
+        file.extend_from_slice(&1u16.to_be_bytes());
+        file.extend_from_slice(&division.to_be_bytes());
+        file.extend_from_slice(b"MTrk");
+        file.extend_from_slice(&(track.len() as u32).to_be_bytes());
+        file.extend_from_slice(&track);
+        file
+    }
+
+    #[test]
+    fn a_midi_file_decodes_to_notes_in_milliseconds() {
+        // 200 ticks at 100 ticks per quarter is two quarters; at the default
+        // 500,000 microseconds per quarter that is one second.
+        let tune = decode_midi(&one_note_file(100, None)).expect("parses");
+        assert_eq!(tune.notes.len(), 1);
+        assert_eq!(tune.notes[0].pitch, 60);
+        assert_eq!(tune.notes[0].start_units, 0);
+        let ms = tune.notes[0].duration_units;
+        assert!((990..=1010).contains(&ms), "expected about 1000 ms, got {ms}");
+        assert_eq!(tune.program_for(0), 54, "the program change is honoured");
+    }
+
+    #[test]
+    fn a_tempo_change_is_applied() {
+        // Twice as fast: 250,000 microseconds per quarter halves the duration.
+        let tune = decode_midi(&one_note_file(100, Some(250_000))).expect("parses");
+        let ms = tune.notes[0].duration_units;
+        assert!((490..=510).contains(&ms), "expected about 500 ms, got {ms}");
+    }
+
+    #[test]
+    fn midi_times_are_reported_against_a_scale_of_one_thousand() {
+        // The rest of the player works in time-scale units, so a MIDI tune
+        // declares the scale that makes its milliseconds come out right.
+        assert_eq!(units_to_ms(1000, MIDI_TIME_SCALE), 1000);
+    }
+
+    #[test]
+    fn a_file_that_is_not_midi_is_refused_rather_than_guessed_at() {
+        assert!(decode_midi(b"not a midi file at all").is_none());
+        assert!(decode_midi(&[]).is_none());
+    }
+
+    #[test]
+    fn smpte_division_is_refused_rather_than_misread() {
+        // A negative division is SMPTE timecode, a different clock; reading it
+        // as ticks-per-quarter would give wildly wrong durations.
+        let mut file = one_note_file(100, None);
+        file[12] = 0xE7; // division high byte with the sign bit set
+        file[13] = 0x28;
+        assert!(decode_midi(&file).is_none());
+    }
+
+    #[test]
+    fn a_truncated_file_does_not_panic() {
+        let full = one_note_file(100, None);
+        for cut in 0..full.len() {
+            let _ = decode_midi(&full[..cut]);
+        }
+    }
+
+    #[test]
+    fn a_substituted_tune_renders_like_any_other() {
+        let tune = decode_midi(&one_note_file(100, None)).expect("parses");
+        let samples = render_tune(&tune, 0x0001_0000, MIDI_TIME_SCALE);
+        assert!(samples.iter().any(|s| s.left != 0x80));
+    }
+}
