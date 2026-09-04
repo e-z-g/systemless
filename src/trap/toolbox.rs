@@ -1052,21 +1052,35 @@ fn tune_stream_checksum(words: &[u32]) -> u32 {
 
 /// Read a tune stream out of guest memory, stopping at its end marker.
 ///
-/// `TuneQueue` is handed a bare pointer with no length, so the terminator is
-/// the only bound the format gives; the cap is a guard against a stream that
-/// never reaches one.
+/// `TuneQueue` and `TuneSetHeader` are handed a bare pointer with no length,
+/// so the terminator is the only bound the format gives. It has to be found
+/// by walking events: `kEndMarkerValue` appears constantly as an operand
+/// inside multi-long events, and stopping at the first such word cuts
+/// Cythera's ninety-six second theme down to eighteen seconds of it.
+///
+/// The cap guards against a stream that never reaches a terminator at all.
 fn read_tune_stream(bus: &mut impl crate::memory::MemoryBus, tune_ptr: u32) -> Vec<u32> {
-    const END_MARKER_VALUE: u32 = 0x6000_0000;
     if tune_ptr == 0 {
         return Vec::new();
     }
-    let mut words = Vec::new();
-    for index in 0..crate::tune_player::MAX_TUNE_LONGS {
+    let mut words: Vec<u32> = Vec::new();
+    let mut index = 0usize;
+    while index < crate::tune_player::MAX_TUNE_LONGS {
         let word = bus.read_long(tune_ptr + (index as u32) * 4);
+        let length = crate::tune_player::event_length_longs(word);
         words.push(word);
-        if word == END_MARKER_VALUE {
+        if word == crate::tune_player::END_MARKER_VALUE {
             break;
         }
+        if length == 0 {
+            break;
+        }
+        // Pull in the rest of this event so the next word examined is the
+        // next event's first long.
+        for offset in 1..length {
+            words.push(bus.read_long(tune_ptr + ((index + offset) as u32) * 4));
+        }
+        index += length;
     }
     words
 }
@@ -1100,8 +1114,22 @@ impl super::TrapDispatcher {
             // TuneSetHeader(tp, unsigned long *header)
             SET_HEADER => {
                 let header = bus.read_long(sp + 4);
+                // The header is a tune stream of its own, carrying the note
+                // requests that say which General MIDI instrument each part
+                // wants. The queued music usually declares none.
+                let words = read_tune_stream(bus, header);
+                let programs = crate::tune_player::decode_tune(&words).programs;
+                if trace {
+                    eprintln!(
+                        "[TUNE] header=${header:08X} longs={} programs={programs:?}",
+                        words.len()
+                    );
+                }
                 if let Some(player) = self.tune_players.get_mut(&instance) {
                     player.header = header;
+                    player.header_programs = programs;
+                    // The instruments changed, so any cached render is stale.
+                    player.rendered = None;
                 }
             }
             // TuneSetTimeScale(tp, TimeScale scale)
@@ -1147,7 +1175,10 @@ impl super::TrapDispatcher {
                 }
 
                 let words = read_tune_stream(bus, tune_ptr);
-                let decoded = crate::tune_player::decode_tune(&words);
+                let mut decoded = crate::tune_player::decode_tune(&words);
+                if let Some(player) = self.tune_players.get(&instance) {
+                    decoded.adopt_header_programs(&player.header_programs);
+                }
                 let duration_ms =
                     crate::tune_player::units_to_ms(decoded.duration_units, time_scale);
                 if trace {
