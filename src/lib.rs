@@ -83,6 +83,7 @@ pub mod sound;
 mod text_edit;
 pub mod trace;
 pub mod trap;
+mod tune_player;
 mod ui_art;
 pub mod ui_theme;
 mod window_manager;

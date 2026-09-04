@@ -1036,7 +1036,217 @@ fn force_button_true_at_pc() -> Option<u32> {
     })
 }
 
+/// A cheap checksum over a tune stream, so a cached render is only reused for
+/// the same bytes. Not a hash with any strength claim -- it guards against the
+/// same address holding a different tune, not against a crafted collision.
+fn tune_stream_checksum(words: &[u32]) -> u32 {
+    words
+        .iter()
+        .fold(0u32, |acc, word| acc.rotate_left(5) ^ *word)
+}
+
+/// `kTuneQueueDepth` from `QuickTimeMusic.h`: how many segments may be queued.
+const TUNE_QUEUE_DEPTH: u16 = 8;
+
+/// Read a tune stream out of guest memory, stopping at its end marker.
+///
+/// `TuneQueue` is handed a bare pointer with no length, so the terminator is
+/// the only bound the format gives; the cap is a guard against a stream that
+/// never reaches one.
+fn read_tune_stream(bus: &mut impl crate::memory::MemoryBus, tune_ptr: u32) -> Vec<u32> {
+    const END_MARKER_VALUE: u32 = 0x6000_0000;
+    if tune_ptr == 0 {
+        return Vec::new();
+    }
+    let mut words = Vec::new();
+    for index in 0..crate::tune_player::MAX_TUNE_LONGS {
+        let word = bus.read_long(tune_ptr + (index as u32) * 4);
+        words.push(word);
+        if word == END_MARKER_VALUE {
+            break;
+        }
+    }
+    words
+}
+
 impl super::TrapDispatcher {
+    /// Serve one call to a `'tune'` component.
+    ///
+    /// Selectors and parameter layouts are from `QuickTimeMusic.h` (Universal
+    /// Interfaces 3.3.1). Pascal pushes arguments left to right, so the first
+    /// declared argument -- the `TunePlayer` itself -- sits highest and the
+    /// last sits just above the selector long at `sp`. Every call returns
+    /// `noErr` through the caller's result slot, which the caller writes.
+    fn dispatch_tune_player_call(
+        &mut self,
+        instance: u32,
+        call_num: u16,
+        sp: u32,
+        param_size: u32,
+        bus: &mut impl crate::memory::MemoryBus,
+    ) {
+        const SET_HEADER: u16 = 0x0004;
+        const SET_TIME_SCALE: u16 = 0x0006;
+        const QUEUE: u16 = 0x000A;
+        const GET_STATUS: u16 = 0x000C;
+        const STOP: u16 = 0x000D;
+        const SET_VOLUME: u16 = 0x0010;
+
+        let tick = self.current_tick();
+        let trace = std::env::var_os("SYSTEMLESS_TRACE_TUNE").is_some();
+
+        match call_num {
+            // TuneSetHeader(tp, unsigned long *header)
+            SET_HEADER => {
+                let header = bus.read_long(sp + 4);
+                if let Some(player) = self.tune_players.get_mut(&instance) {
+                    player.header = header;
+                }
+            }
+            // TuneSetTimeScale(tp, TimeScale scale)
+            SET_TIME_SCALE => {
+                let scale = bus.read_long(sp + 4);
+                if let Some(player) = self.tune_players.get_mut(&instance) {
+                    player.time_scale = scale.max(1);
+                }
+            }
+            // TuneSetVolume(tp, Fixed volume)
+            SET_VOLUME => {
+                let volume = bus.read_long(sp + 4);
+                if let Some(player) = self.tune_players.get_mut(&instance) {
+                    player.volume_fixed = volume;
+                }
+            }
+            // TuneStop(tp, long stopFlags)
+            STOP => {
+                if let Some(player) = self.tune_players.get_mut(&instance) {
+                    player.playing_until_tick = None;
+                    player.current_tune = 0;
+                }
+                self.sound_manager.stop_tune_channel(instance);
+            }
+            // TuneQueue(tp, tune, tuneRate, startPosition, stopPosition,
+            //           queueFlags, callBackProc, refCon)
+            QUEUE => {
+                let tune_ptr = bus.read_long(sp + 28);
+                let (volume, time_scale) = self
+                    .tune_players
+                    .get(&instance)
+                    .map_or((0x0001_0000, 600), |player| {
+                        (player.volume_fixed, player.time_scale)
+                    });
+                let words = read_tune_stream(bus, tune_ptr);
+                let decoded = crate::tune_player::decode_tune(&words);
+                if trace {
+                    eprintln!(
+                        "[TUNE] queue tick={} tune=${:08X} longs={} notes={} units={} scale={} duration={}ms",
+                        tick,
+                        tune_ptr,
+                        words.len(),
+                        decoded.notes.len(),
+                        decoded.duration_units,
+                        time_scale,
+                        crate::tune_player::units_to_ms(decoded.duration_units, time_scale)
+                    );
+                }
+                if decoded.notes.is_empty() {
+                    return;
+                }
+                let checksum = tune_stream_checksum(&words);
+                let cached = self.tune_players.get(&instance).and_then(|player| {
+                    player.rendered.as_ref().filter(|rendered| {
+                        rendered.tune_ptr == tune_ptr
+                            && rendered.longs == words.len()
+                            && rendered.checksum == checksum
+                            && rendered.volume_fixed == volume
+                            && rendered.time_scale == time_scale
+                    })
+                });
+                let samples = match cached {
+                    Some(rendered) => rendered.samples.clone(),
+                    None => {
+                        let rendered =
+                            crate::tune_player::render_tune(&decoded, volume, time_scale);
+                        if let Some(player) = self.tune_players.get_mut(&instance) {
+                            player.rendered = Some(super::dispatch::RenderedTune {
+                                tune_ptr,
+                                longs: words.len(),
+                                checksum,
+                                volume_fixed: volume,
+                                time_scale,
+                                samples: rendered.clone(),
+                            });
+                        }
+                        rendered
+                    }
+                };
+                // Ticks run at 60 Hz. `TuneGetStatus` reports a queue count
+                // until this passes, which is what GMSTune::Idle waits on.
+                let duration_ms =
+                    crate::tune_player::units_to_ms(decoded.duration_units, time_scale);
+                let ticks = duration_ms.saturating_mul(60) / 1000;
+                if let Some(player) = self.tune_players.get_mut(&instance) {
+                    player.current_tune = tune_ptr;
+                    player.playing_until_tick = Some(tick.wrapping_add(ticks.max(1)));
+                }
+                self.sound_manager.play_tune_samples(instance, samples);
+            }
+            // TuneGetStatus(tp, TuneStatus *status)
+            GET_STATUS => {
+                let status_ptr = bus.read_long(sp + 4);
+                let (tune, playing) = {
+                    let player = self.tune_players.get_mut(&instance);
+                    match player {
+                        Some(player) => {
+                            let still_playing = match player.playing_until_tick {
+                                // Guest ticks wrap; the same comparison the
+                                // Event Manager uses for due times.
+                                Some(due) => tick.wrapping_sub(due) >= 0x8000_0000,
+                                None => false,
+                            };
+                            if !still_playing {
+                                player.playing_until_tick = None;
+                                player.current_tune = 0;
+                            }
+                            (player.current_tune, still_playing)
+                        }
+                        None => (0, false),
+                    }
+                };
+                if trace {
+                    eprintln!(
+                        "[TUNE] status tick={} due={:?} playing={}",
+                        tick,
+                        self.tune_players
+                            .get(&instance)
+                            .and_then(|player| player.playing_until_tick),
+                        playing
+                    );
+                }
+                if status_ptr != 0 {
+                    // TuneStatus: tune, tunePtr, time, queueCount(short),
+                    // queueSpots(short), queueTime, reserved[3].
+                    bus.write_long(status_ptr, tune);
+                    bus.write_long(status_ptr + 4, tune);
+                    bus.write_long(status_ptr + 8, 0);
+                    bus.write_word(status_ptr + 12, u16::from(playing));
+                    bus.write_word(
+                        status_ptr + 14,
+                        if playing { TUNE_QUEUE_DEPTH - 1 } else { TUNE_QUEUE_DEPTH },
+                    );
+                    bus.write_long(status_ptr + 16, 0);
+                    for offset in 0..3u32 {
+                        bus.write_long(status_ptr + 20 + offset * 4, 0);
+                    }
+                }
+            }
+            // TunePreroll, TuneUnroll and everything else this host does not
+            // model: accepted, with noErr, and no state change.
+            _ => {}
+        }
+        let _ = param_size;
+    }
+
     /// Whether `SystemTask` currently has periodic Desk Manager work to do.
     ///
     /// Inside Macintosh Volume I, I-442 and I-444 through I-445, specifies
@@ -16472,6 +16682,9 @@ impl super::TrapDispatcher {
             //
             (true, 0x02A) => {
                 const MOVIE_CONTROLLER_COMPONENT: u32 = u32::from_be_bytes(*b"play");
+                // QuickTime Music Architecture tune player. Sequences a
+                // 'Tune' event stream; see `crate::tune_player`.
+                const TUNE_PLAYER_COMPONENT: u32 = u32::from_be_bytes(*b"tune");
                 const SYNTHETIC_MOVIE_CONTROLLER: u32 = 0x00C0_0001;
 
                 let d0 = cpu.read_reg(Register::D0);
@@ -16494,6 +16707,14 @@ impl super::TrapDispatcher {
                         );
                     }
                     let instance = bus.read_long(sp + 4 + param_size);
+                    if self.tune_players.contains_key(&instance) {
+                        self.dispatch_tune_player_call(instance, call_num, sp, param_size, bus);
+                        let result_sp = sp + 8 + param_size;
+                        bus.write_long(result_sp, 0);
+                        cpu.write_reg(Register::A7, result_sp);
+                        cpu.write_reg(Register::D0, 0);
+                        return Some(Ok(()));
+                    }
                     match call_num {
                         // MCNewAttachedController(mc, theMovie, window, where):
                         // associate the controller instance with its movie so
@@ -16617,6 +16838,9 @@ impl super::TrapDispatcher {
                         // CloseComponent(ComponentInstance): OSErr
                         let instance = bus.read_long(sp);
                         self.synthetic_component_instances.remove(&instance);
+                        if self.tune_players.remove(&instance).is_some() {
+                            self.sound_manager.stop_tune_channel(instance);
+                        }
                         bus.write_word(sp + 4, 0);
                         cpu.write_reg(Register::A7, sp + 4);
                         cpu.write_reg(Register::D0, 0);
@@ -16630,11 +16854,17 @@ impl super::TrapDispatcher {
                     0x0021 => {
                         // OpenDefaultComponent(OSType, OSType): ComponentInstance
                         let component_type = bus.read_long(sp + 4);
-                        let instance = if component_type == MOVIE_CONTROLLER_COMPONENT {
+                        let instance = if component_type == MOVIE_CONTROLLER_COMPONENT
+                            || component_type == TUNE_PLAYER_COMPONENT
+                        {
                             let instance = self.next_synthetic_component_instance;
                             self.next_synthetic_component_instance =
                                 self.next_synthetic_component_instance.saturating_add(1);
                             self.synthetic_component_instances.insert(instance);
+                            if component_type == TUNE_PLAYER_COMPONENT {
+                                self.tune_players
+                                    .insert(instance, super::dispatch::TunePlayerState::default());
+                            }
                             instance
                         } else {
                             0

@@ -1706,6 +1706,57 @@ impl TrapTableProfile {
 }
 
 /// Trap dispatcher with resource fork access and emulator state.
+/// One `'tune'` component instance.
+///
+/// `queue_count` is what the guest sees through `TuneGetStatus`; it drops to
+/// zero when the queued audio has played out, because that is the signal
+/// `GMSTune::Idle` waits for before queueing the next segment. Without it the
+/// game either never advances or re-queues without pause.
+#[derive(Clone, Debug)]
+pub(crate) struct TunePlayerState {
+    /// Guest pointer last given to `TuneSetHeader`, kept for diagnostics.
+    pub(crate) header: u32,
+    /// `TuneSetTimeScale`; QuickTime time units per second. Cythera asks 600.
+    pub(crate) time_scale: u32,
+    /// `TuneSetVolume`, a `Fixed` where 0x0001_0000 is unity.
+    pub(crate) volume_fixed: u32,
+    /// Guest tick at which the queued audio finishes, if anything is queued.
+    pub(crate) playing_until_tick: Option<u32>,
+    /// The tune pointer currently playing, reported by `TuneGetStatus`.
+    pub(crate) current_tune: u32,
+    /// The last tune rendered on this player, so that looping a segment does
+    /// not re-synthesise it. `GMSTune::Idle` re-queues the same tune every
+    /// time it runs out, which for a long session is hundreds of repeats.
+    /// Keyed by the guest pointer, the stream length, a checksum of the
+    /// stream and the volume, so that a tune edited in place, or replaced at
+    /// the same address, still renders again.
+    pub(crate) rendered: Option<RenderedTune>,
+}
+
+/// One cached render, held by a `TunePlayerState`.
+#[derive(Clone, Debug)]
+pub(crate) struct RenderedTune {
+    pub(crate) tune_ptr: u32,
+    pub(crate) longs: usize,
+    pub(crate) checksum: u32,
+    pub(crate) volume_fixed: u32,
+    pub(crate) time_scale: u32,
+    pub(crate) samples: Vec<crate::sound::StereoSample>,
+}
+
+impl Default for TunePlayerState {
+    fn default() -> Self {
+        Self {
+            header: 0,
+            time_scale: 600,
+            volume_fixed: 0x0001_0000,
+            playing_until_tick: None,
+            current_tune: 0,
+            rendered: None,
+        }
+    }
+}
+
 pub struct TrapDispatcher {
     /// Synthetic keyboard and mouse entries exposed by the ADB Manager.
     pub(crate) adb: crate::adb::AdbManager,
@@ -1895,6 +1946,11 @@ pub struct TrapDispatcher {
     /// Synthetic Component Manager instances opened for HLE-provided
     /// components such as the QuickTime movie controller.
     pub(crate) synthetic_component_instances: HashSet<u32>,
+    /// Live `'tune'` components, keyed by ComponentInstance. A tune player
+    /// holds the sequence it was queued, the volume and time scale it was
+    /// given, and the guest tick at which the rendered audio will run out --
+    /// which is what `TuneGetStatus` reports and `GMSTune::Idle` polls.
+    pub(crate) tune_players: HashMap<u32, TunePlayerState>,
     /// Next opaque ComponentInstance value returned by OpenComponent.
     pub(crate) next_synthetic_component_instance: u32,
     /// Saved old structure/content regions keyed by window pointer.
@@ -3894,6 +3950,7 @@ impl TrapDispatcher {
             cooperative_thread_stack_size: DEFAULT_COOPERATIVE_THREAD_STACK_SIZE,
             cooperative_thread_pool: Vec::new(),
             synthetic_component_instances: HashSet::new(),
+            tune_players: HashMap::new(),
             next_synthetic_component_instance: 0x00C1_0001,
             saved_draw_old_regions: HashMap::new(),
             fired_oapp_handler: false,
