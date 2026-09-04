@@ -633,6 +633,33 @@ impl SoundManager {
         self.channels.push(channel);
     }
 
+    /// Play one rendered tune on the channel belonging to a tune player.
+    ///
+    /// The component instance stands in for a guest `SndChannel` pointer: a
+    /// tune player has no channel of its own, but it needs a distinct one so
+    /// that stopping the music does not silence sound effects.
+    pub(crate) fn play_tune_samples(&mut self, instance: u32, samples: Vec<StereoSample>) {
+        let channel = self.ensure_channel_mut(instance);
+        channel.quiet();
+        channel.play_stereo_buffer(
+            samples,
+            (OUTPUT_RATE << 16) as u32,
+            PlaybackKind::Buffer,
+            0,
+        );
+    }
+
+    /// Silence a tune player's channel, for `TuneStop` and `CloseComponent`.
+    pub(crate) fn stop_tune_channel(&mut self, instance: u32) {
+        if let Some(channel) = self
+            .channels
+            .iter_mut()
+            .find(|channel| channel.guest_ptr == instance)
+        {
+            channel.quiet();
+        }
+    }
+
     fn ensure_channel_mut(&mut self, guest_ptr: u32) -> &mut SndChannel {
         if let Some(index) = self
             .channels
@@ -1256,6 +1283,49 @@ fn apply_volume_channel(sample: u8, volume: i32) -> u8 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_queued_tune_reaches_the_mixer_as_audible_samples() {
+        // The tune player has no guest SndChannel, so it opens one keyed by
+        // its ComponentInstance. This pins the whole path: if the mixer ever
+        // filters channels by guest visibility, or play_tune_samples stops
+        // marking the channel as playing, the game goes silent with every
+        // trap still returning noErr and nothing in any log.
+        let mut manager = SoundManager::new();
+        let instance = 0x00C1_0001;
+        let samples = vec![
+            StereoSample { left: 0xFF, right: 0x00 },
+            StereoSample { left: 0x00, right: 0xFF },
+            StereoSample { left: 0xFF, right: 0x00 },
+            StereoSample { left: 0x00, right: 0xFF },
+        ];
+        manager.play_tune_samples(instance, samples);
+
+        let mixed = manager.mix_frame_stereo_frames(4);
+        assert!(
+            mixed.iter().any(|frame| frame.left != 0x80 || frame.right != 0x80),
+            "a queued tune must reach the mixer, not sit silently on its channel"
+        );
+    }
+
+    #[test]
+    fn stopping_a_tune_channel_silences_only_that_channel() {
+        let mut manager = SoundManager::new();
+        let tune = 0x00C1_0001;
+        let effect = 0x0009_0000;
+        let loud = vec![StereoSample { left: 0xFF, right: 0xFF }; 4];
+        manager.play_tune_samples(tune, loud.clone());
+        manager.play_tune_samples(effect, loud);
+
+        manager.stop_tune_channel(tune);
+
+        let mixed = manager.mix_frame_stereo_frames(4);
+        assert!(
+            mixed.iter().any(|frame| frame.left != 0x80 || frame.right != 0x80),
+            "stopping the music must not silence the other channel"
+        );
+    }
+
     use super::*;
 
     /// Regression gate for `SoundManager::new()` default field values:

@@ -90,6 +90,7 @@ mod text_edit;
 mod thread_manager;
 pub mod trace;
 pub mod trap;
+mod tune_player;
 mod ui_art;
 pub mod ui_theme;
 mod window_manager;
