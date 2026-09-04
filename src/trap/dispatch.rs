@@ -1345,34 +1345,19 @@ impl TrapTableProfile {
 }
 
 /// Trap dispatcher with resource fork access and emulator state.
-/// One `'tune'` component instance.
+/// One segment sitting in a tune player's queue.
 ///
-/// `queue_count` is what the guest sees through `TuneGetStatus`; it drops to
-/// zero when the queued audio has played out, because that is the signal
-/// `GMSTune::Idle` waits for before queueing the next segment. Without it the
-/// game either never advances or re-queues without pause.
+/// Rendered when it is queued rather than when it starts, so that the cost
+/// lands on the call that already expects to do work.
 #[derive(Clone, Debug)]
-pub(crate) struct TunePlayerState {
-    /// Guest pointer last given to `TuneSetHeader`, kept for diagnostics.
-    pub(crate) header: u32,
-    /// `TuneSetTimeScale`; QuickTime time units per second. Cythera asks 600.
-    pub(crate) time_scale: u32,
-    /// `TuneSetVolume`, a `Fixed` where 0x0001_0000 is unity.
-    pub(crate) volume_fixed: u32,
-    /// Guest tick at which the queued audio finishes, if anything is queued.
-    pub(crate) playing_until_tick: Option<u32>,
-    /// The tune pointer currently playing, reported by `TuneGetStatus`.
-    pub(crate) current_tune: u32,
-    /// The last tune rendered on this player, so that looping a segment does
-    /// not re-synthesise it. `GMSTune::Idle` re-queues the same tune every
-    /// time it runs out, which for a long session is hundreds of repeats.
-    /// Keyed by the guest pointer, the stream length, a checksum of the
-    /// stream and the volume, so that a tune edited in place, or replaced at
-    /// the same address, still renders again.
-    pub(crate) rendered: Option<RenderedTune>,
+pub(crate) struct QueuedTuneSegment {
+    pub(crate) tune_ptr: u32,
+    pub(crate) duration_ticks: u32,
+    pub(crate) samples: Vec<crate::sound::StereoSample>,
 }
 
-/// One cached render, held by a `TunePlayerState`.
+/// One cached render, so that looping a segment does not re-synthesise it.
+/// Keyed by everything that changes the samples.
 #[derive(Clone, Debug)]
 pub(crate) struct RenderedTune {
     pub(crate) tune_ptr: u32,
@@ -1383,16 +1368,185 @@ pub(crate) struct RenderedTune {
     pub(crate) samples: Vec<crate::sound::StereoSample>,
 }
 
+/// One `'tune'` component instance.
+///
+/// The queue is the point of this type. `TuneQueue` appends and returns; the
+/// segments play in order, and `TuneGetStatus` reports how many are waiting.
+/// An application drives its music entirely from that count -- Cythera's
+/// `GMSTune::Idle` queues only when it reads zero -- so a player that instead
+/// replaced whatever was playing would let two sources of music cut each
+/// other off, which is exactly what a single-slot version did.
+#[derive(Clone, Debug)]
+pub(crate) struct TunePlayerState {
+    /// Guest pointer last given to `TuneSetHeader`, kept for diagnostics.
+    pub(crate) header: u32,
+    /// `TuneSetTimeScale`; units per second. Cythera asks for 600.
+    pub(crate) time_scale: u32,
+    /// `TuneSetVolume`, a `Fixed` where 0x0001_0000 is unity.
+    pub(crate) volume_fixed: u32,
+    /// Segments waiting to play, head first. The head is the one sounding.
+    pub(crate) queue: std::collections::VecDeque<QueuedTuneSegment>,
+    /// Guest tick at which the head finishes.
+    pub(crate) head_until_tick: Option<u32>,
+    /// The last render, reused when the same segment is queued again.
+    pub(crate) rendered: Option<RenderedTune>,
+}
+
+/// `kTuneQueueDepth` from `QuickTimeMusic.h`: the deepest a tune player queues.
+pub(crate) const TUNE_QUEUE_DEPTH: usize = 8;
+
 impl Default for TunePlayerState {
     fn default() -> Self {
         Self {
             header: 0,
             time_scale: 600,
             volume_fixed: 0x0001_0000,
-            playing_until_tick: None,
-            current_tune: 0,
+            queue: std::collections::VecDeque::new(),
+            head_until_tick: None,
             rendered: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tune_queue_tests {
+    use super::*;
+
+    fn segment(tune_ptr: u32, ticks: u32) -> QueuedTuneSegment {
+        QueuedTuneSegment {
+            tune_ptr,
+            duration_ticks: ticks,
+            samples: vec![crate::sound::StereoSample { left: 0xC0, right: 0xC0 }; 4],
+        }
+    }
+
+    #[test]
+    fn a_second_source_of_music_queues_behind_the_first() {
+        // The bug this pins. Cythera idles a foreground tune while calling
+        // Resume on the background one, and both reach the same player. With
+        // a single slot the second cut off the first and the music flipped
+        // between them; queued, they take turns.
+        let mut player = TunePlayerState::default();
+        player.queue.push_back(segment(0x1111, 60));
+        assert!(player.advance(1000).is_some(), "the first segment starts");
+        player.queue.push_back(segment(0x2222, 60));
+
+        assert_eq!(player.current_tune(), 0x1111, "the first keeps playing");
+        assert_eq!(player.queue_count(), 2);
+        assert!(player.advance(1030).is_none(), "nothing starts mid-segment");
+        assert_eq!(player.current_tune(), 0x1111);
+
+        assert!(player.advance(1060).is_some(), "the second follows it");
+        assert_eq!(player.current_tune(), 0x2222);
+        assert_eq!(player.queue_count(), 1);
+    }
+
+    #[test]
+    fn queue_count_is_what_keeps_an_idle_loop_quiet() {
+        // GMSTune::Idle queues only when queueCount reads zero, so the count
+        // must include the segment that is sounding.
+        let mut player = TunePlayerState::default();
+        assert_eq!(player.queue_count(), 0, "an idle player invites a queue");
+        player.queue.push_back(segment(0x1111, 60));
+        player.advance(0);
+        assert_eq!(player.queue_count(), 1, "a sounding segment still counts");
+        assert_eq!(player.queue_spots(), (TUNE_QUEUE_DEPTH - 1) as u16);
+    }
+
+    #[test]
+    fn the_queue_drains_in_order_and_then_reports_empty() {
+        let mut player = TunePlayerState::default();
+        for id in 1..=3u32 {
+            player.queue.push_back(segment(0x1000 + id, 10));
+        }
+        player.advance(0);
+        assert_eq!(player.current_tune(), 0x1001);
+        player.advance(10);
+        assert_eq!(player.current_tune(), 0x1002);
+        player.advance(20);
+        assert_eq!(player.current_tune(), 0x1003);
+        player.advance(30);
+        assert_eq!(player.queue_count(), 0);
+        assert_eq!(player.current_tune(), 0);
+        assert_eq!(player.queue_spots(), TUNE_QUEUE_DEPTH as u16);
+    }
+
+    #[test]
+    fn stopping_clears_everything_that_was_waiting() {
+        let mut player = TunePlayerState::default();
+        player.queue.push_back(segment(0x1111, 60));
+        player.queue.push_back(segment(0x2222, 60));
+        player.advance(0);
+        player.stop();
+        assert_eq!(player.queue_count(), 0);
+        assert_eq!(player.current_tune(), 0);
+        assert!(player.advance(100).is_none());
+    }
+
+    #[test]
+    fn a_segment_due_exactly_now_is_retired() {
+        let mut player = TunePlayerState::default();
+        player.queue.push_back(segment(0x1111, 10));
+        player.advance(0);
+        assert!(player.advance(10).is_none(), "nothing left to start");
+        assert_eq!(player.queue_count(), 0);
+    }
+
+    #[test]
+    fn a_wrapping_tick_does_not_retire_a_segment_early() {
+        // Guest ticks wrap at 32 bits; a naive comparison would treat the
+        // wrap as the segment having finished long ago.
+        let mut player = TunePlayerState::default();
+        player.queue.push_back(segment(0x1111, 100));
+        player.advance(u32::MAX - 50);
+        assert_eq!(player.current_tune(), 0x1111);
+        // 20 ticks later, still inside the segment despite having wrapped.
+        assert!(player.advance(u32::MAX.wrapping_add(20)).is_none());
+        assert_eq!(player.queue_count(), 1, "still sounding across the wrap");
+    }
+}
+
+impl TunePlayerState {
+    /// Retire the head if its time has passed, then start the next segment if
+    /// nothing is sounding. Returns the samples to hand the mixer, if a
+    /// segment just started.
+    ///
+    /// Guest ticks wrap, so "has this tick arrived" is the same subtraction
+    /// the Event Manager uses for due times rather than a plain comparison.
+    pub(crate) fn advance(&mut self, tick: u32) -> Option<Vec<crate::sound::StereoSample>> {
+        if let Some(until) = self.head_until_tick {
+            if tick.wrapping_sub(until) < 0x8000_0000 {
+                self.queue.pop_front();
+                self.head_until_tick = None;
+            }
+        }
+        if self.head_until_tick.is_none() {
+            if let Some(head) = self.queue.front() {
+                self.head_until_tick = Some(tick.wrapping_add(head.duration_ticks.max(1)));
+                return Some(head.samples.clone());
+            }
+        }
+        None
+    }
+
+    /// How many segments are waiting, the playing one included. This is what
+    /// `TuneStatus.queueCount` reports.
+    pub(crate) fn queue_count(&self) -> u16 {
+        self.queue.len().min(u16::MAX as usize) as u16
+    }
+
+    pub(crate) fn queue_spots(&self) -> u16 {
+        TUNE_QUEUE_DEPTH.saturating_sub(self.queue.len()) as u16
+    }
+
+    /// The tune currently sounding, or zero.
+    pub(crate) fn current_tune(&self) -> u32 {
+        self.queue.front().map_or(0, |segment| segment.tune_ptr)
+    }
+
+    pub(crate) fn stop(&mut self) {
+        self.queue.clear();
+        self.head_until_tick = None;
     }
 }
 

@@ -1050,9 +1050,6 @@ fn tune_stream_checksum(words: &[u32]) -> u32 {
         .fold(0u32, |acc, word| acc.rotate_left(5) ^ *word)
 }
 
-/// `kTuneQueueDepth` from `QuickTimeMusic.h`: how many segments may be queued.
-const TUNE_QUEUE_DEPTH: u16 = 8;
-
 /// Read a tune stream out of guest memory, stopping at its end marker.
 ///
 /// `TuneQueue` is handed a bare pointer with no length, so the terminator is
@@ -1087,7 +1084,6 @@ impl super::TrapDispatcher {
         instance: u32,
         call_num: u16,
         sp: u32,
-        param_size: u32,
         bus: &mut impl crate::memory::MemoryBus,
     ) {
         const SET_HEADER: u16 = 0x0004;
@@ -1125,8 +1121,7 @@ impl super::TrapDispatcher {
             // TuneStop(tp, long stopFlags)
             STOP => {
                 if let Some(player) = self.tune_players.get_mut(&instance) {
-                    player.playing_until_tick = None;
-                    player.current_tune = 0;
+                    player.stop();
                 }
                 self.sound_manager.stop_tune_channel(instance);
             }
@@ -1134,24 +1129,38 @@ impl super::TrapDispatcher {
             //           queueFlags, callBackProc, refCon)
             QUEUE => {
                 let tune_ptr = bus.read_long(sp + 28);
-                let (volume, time_scale) = self
-                    .tune_players
-                    .get(&instance)
-                    .map_or((0x0001_0000, 600), |player| {
-                        (player.volume_fixed, player.time_scale)
-                    });
+                let Some((volume, time_scale, spots)) =
+                    self.tune_players.get(&instance).map(|player| {
+                        (player.volume_fixed, player.time_scale, player.queue_spots())
+                    })
+                else {
+                    return;
+                };
+                if spots == 0 {
+                    // A full queue is `tunePlayerFullErr` on a real player.
+                    // Dropping the segment is closer to that than silently
+                    // displacing something already accepted.
+                    if trace {
+                        eprintln!("[TUNE] queue refused, full: tune=${tune_ptr:08X}");
+                    }
+                    return;
+                }
+
                 let words = read_tune_stream(bus, tune_ptr);
                 let decoded = crate::tune_player::decode_tune(&words);
+                let duration_ms =
+                    crate::tune_player::units_to_ms(decoded.duration_units, time_scale);
                 if trace {
                     eprintln!(
-                        "[TUNE] queue tick={} tune=${:08X} longs={} notes={} units={} scale={} duration={}ms",
+                        "[TUNE] queue tick={} tune=${:08X} longs={} notes={} units={} scale={} duration={}ms spots={}",
                         tick,
                         tune_ptr,
                         words.len(),
                         decoded.notes.len(),
                         decoded.duration_units,
                         time_scale,
-                        crate::tune_player::units_to_ms(decoded.duration_units, time_scale)
+                        duration_ms,
+                        spots
                     );
                 }
                 if decoded.notes.is_empty() {
@@ -1185,60 +1194,37 @@ impl super::TrapDispatcher {
                         rendered
                     }
                 };
-                // Ticks run at 60 Hz. `TuneGetStatus` reports a queue count
-                // until this passes, which is what GMSTune::Idle waits on.
-                let duration_ms =
-                    crate::tune_player::units_to_ms(decoded.duration_units, time_scale);
-                let ticks = duration_ms.saturating_mul(60) / 1000;
+
+                // Ticks run at 60 Hz.
+                let duration_ticks = duration_ms.saturating_mul(60) / 1000;
                 if let Some(player) = self.tune_players.get_mut(&instance) {
-                    player.current_tune = tune_ptr;
-                    player.playing_until_tick = Some(tick.wrapping_add(ticks.max(1)));
+                    player.queue.push_back(super::dispatch::QueuedTuneSegment {
+                        tune_ptr,
+                        duration_ticks,
+                        samples,
+                    });
                 }
-                self.sound_manager.play_tune_samples(instance, samples);
+                self.start_due_tune_segment(instance, tick);
             }
             // TuneGetStatus(tp, TuneStatus *status)
             GET_STATUS => {
+                self.start_due_tune_segment(instance, tick);
                 let status_ptr = bus.read_long(sp + 4);
-                let (tune, playing) = {
-                    let player = self.tune_players.get_mut(&instance);
-                    match player {
-                        Some(player) => {
-                            let still_playing = match player.playing_until_tick {
-                                // Guest ticks wrap; the same comparison the
-                                // Event Manager uses for due times.
-                                Some(due) => tick.wrapping_sub(due) >= 0x8000_0000,
-                                None => false,
-                            };
-                            if !still_playing {
-                                player.playing_until_tick = None;
-                                player.current_tune = 0;
-                            }
-                            (player.current_tune, still_playing)
-                        }
-                        None => (0, false),
-                    }
+                let Some((tune, count, spots)) = self
+                    .tune_players
+                    .get(&instance)
+                    .map(|player| (player.current_tune(), player.queue_count(), player.queue_spots()))
+                else {
+                    return;
                 };
-                if trace {
-                    eprintln!(
-                        "[TUNE] status tick={} due={:?} playing={}",
-                        tick,
-                        self.tune_players
-                            .get(&instance)
-                            .and_then(|player| player.playing_until_tick),
-                        playing
-                    );
-                }
                 if status_ptr != 0 {
                     // TuneStatus: tune, tunePtr, time, queueCount(short),
                     // queueSpots(short), queueTime, reserved[3].
                     bus.write_long(status_ptr, tune);
                     bus.write_long(status_ptr + 4, tune);
                     bus.write_long(status_ptr + 8, 0);
-                    bus.write_word(status_ptr + 12, u16::from(playing));
-                    bus.write_word(
-                        status_ptr + 14,
-                        if playing { TUNE_QUEUE_DEPTH - 1 } else { TUNE_QUEUE_DEPTH },
-                    );
+                    bus.write_word(status_ptr + 12, count);
+                    bus.write_word(status_ptr + 14, spots);
                     bus.write_long(status_ptr + 16, 0);
                     for offset in 0..3u32 {
                         bus.write_long(status_ptr + 20 + offset * 4, 0);
@@ -1249,8 +1235,22 @@ impl super::TrapDispatcher {
             // model: accepted, with noErr, and no state change.
             _ => {}
         }
-        let _ = param_size;
     }
+
+    /// Retire a finished segment and start the next, if one is waiting.
+    ///
+    /// Split out because the queue and the Sound Manager are separate fields
+    /// and the samples have to leave the player before the mixer is touched.
+    fn start_due_tune_segment(&mut self, instance: u32, tick: u32) {
+        let started = self
+            .tune_players
+            .get_mut(&instance)
+            .and_then(|player| player.advance(tick));
+        if let Some(samples) = started {
+            self.sound_manager.play_tune_samples(instance, samples);
+        }
+    }
+
 
     /// Whether `SystemTask` currently has periodic Desk Manager work to do.
     ///
@@ -16670,7 +16670,7 @@ impl super::TrapDispatcher {
                     }
                     let instance = bus.read_long(sp + 4 + param_size);
                     if self.tune_players.contains_key(&instance) {
-                        self.dispatch_tune_player_call(instance, call_num, sp, param_size, bus);
+                        self.dispatch_tune_player_call(instance, call_num, sp, bus);
                         let result_sp = sp + 8 + param_size;
                         bus.write_long(result_sp, 0);
                         cpu.write_reg(Register::A7, result_sp);
