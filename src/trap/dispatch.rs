@@ -1741,6 +1741,8 @@ pub(crate) struct RenderedTune {
 pub(crate) struct TunePlayerState {
     /// Guest pointer last given to `TuneSetHeader`, kept for diagnostics.
     pub(crate) header: u32,
+    /// Part to General MIDI program, from the header's note requests.
+    pub(crate) header_programs: Vec<(u8, u8)>,
     /// `TuneSetTimeScale`; units per second. Cythera asks for 600.
     pub(crate) time_scale: u32,
     /// `TuneSetVolume`, a `Fixed` where 0x0001_0000 is unity.
@@ -1760,6 +1762,7 @@ impl Default for TunePlayerState {
     fn default() -> Self {
         Self {
             header: 0,
+            header_programs: Vec::new(),
             time_scale: 600,
             volume_fixed: 0x0001_0000,
             queue: std::collections::VecDeque::new(),

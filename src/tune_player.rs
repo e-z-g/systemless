@@ -16,7 +16,13 @@
 use crate::sound::{StereoSample, OUTPUT_RATE};
 
 /// End of a tune stream. `QuickTimeMusic.h`, `kEndMarkerValue`.
-const END_MARKER_VALUE: u32 = 0x6000_0000;
+///
+/// This value is only a terminator when it falls on an event boundary. It
+/// occurs freely as an operand inside multi-long events, so a reader that
+/// scans for the word rather than walking events truncates the tune: the
+/// first such word in Cythera's theme sits 1,952 bytes in, where the piece
+/// runs to 8,408.
+pub(crate) const END_MARKER_VALUE: u32 = 0x6000_0000;
 
 // Event header fields, shared by every event type.
 const EVENT_LENGTH_POS: u32 = 30;
@@ -111,7 +117,7 @@ fn event_type(word: u32) -> u32 {
 
 /// How many longs this event occupies. A length field of 3 means the count
 /// lives in the event's own general-length field, counted in longs.
-fn event_length_longs(word: u32) -> usize {
+pub(crate) fn event_length_longs(word: u32) -> usize {
     match extract(word, EVENT_LENGTH_POS, EVENT_LENGTH_WIDTH) {
         3 => extract(word, GENERAL_LENGTH_POS, GENERAL_LENGTH_WIDTH) as usize,
         2 => 2,
@@ -143,6 +149,21 @@ pub(crate) struct DecodedTune {
 }
 
 impl DecodedTune {
+    /// Adopt instrument assignments from the tune's header.
+    ///
+    /// `TuneSetHeader` carries the note requests -- the General MIDI program
+    /// each part asks for -- and the queued stream usually carries none. A
+    /// player that reads only the stream therefore renders every part on
+    /// program 0, an acoustic grand piano, whatever the tune asked for.
+    /// Anything the stream does declare wins, because it comes later.
+    pub(crate) fn adopt_header_programs(&mut self, header: &[(u8, u8)]) {
+        for (part, program) in header {
+            if !self.programs.iter().any(|(p, _)| p == part) {
+                self.programs.push((*part, *program));
+            }
+        }
+    }
+
     pub(crate) fn program_for(&self, part: u8) -> u8 {
         self.programs
             .iter()
@@ -515,6 +536,59 @@ mod tests {
         assert_eq!(tune.notes[2].start_units, 500);
         assert_eq!(tune.notes[2].pitch, 67);
         assert_eq!(tune.duration_units, 750);
+    }
+
+    #[test]
+    fn an_end_marker_inside_an_event_is_not_a_terminator() {
+        // The bug this pins. kEndMarkerValue occurs freely as an operand, and
+        // a reader that scans for the word instead of walking events stops
+        // there. In Cythera's theme the first such word is 1,952 bytes into a
+        // 8,408 byte piece, so the music ended after a fifth of itself.
+        let general_with_marker_operand = [
+            // A general event declaring three longs, whose payload happens to
+            // contain the end marker value.
+            (3u32 << EVENT_LENGTH_POS) | (GENERAL_EVENT_TYPE << X_EVENT_TYPE_POS) | 3,
+            END_MARKER_VALUE,
+            0,
+            note(0, 60, 100, 250),
+            END_MARKER_VALUE,
+        ];
+        let tune = decode_tune(&general_with_marker_operand);
+        assert_eq!(
+            tune.notes.len(),
+            1,
+            "the note after the embedded marker must still be decoded"
+        );
+    }
+
+    #[test]
+    fn header_programs_fill_in_parts_the_stream_does_not_name() {
+        // TuneSetHeader carries the note requests; the queued stream usually
+        // declares none, so without this every part renders as program 0, an
+        // acoustic grand piano.
+        let mut tune = decode_tune(&[note(1, 60, 100, 250), END_MARKER_VALUE]);
+        assert_eq!(tune.program_for(1), 0, "nothing declared yet");
+        tune.adopt_header_programs(&[(1, 54), (2, 87)]);
+        assert_eq!(tune.program_for(1), 54, "the header names part 1");
+        assert_eq!(tune.program_for(2), 87);
+    }
+
+    #[test]
+    fn a_program_in_the_stream_beats_the_header() {
+        let mut tune = decode_tune(&[note(1, 60, 100, 250), END_MARKER_VALUE]);
+        tune.programs.push((1, 20));
+        tune.adopt_header_programs(&[(1, 54)]);
+        assert_eq!(tune.program_for(1), 20);
+    }
+
+    #[test]
+    fn general_midi_voices_are_sung_rather_than_bowed() {
+        // 52..54 are Choir Aahs, Voice Oohs and Synth Voice, and sit between
+        // the strings and the brass in the General MIDI order; Cythera's
+        // theme carries its lead on 54.
+        assert_eq!(timbre(54).1, Voicing::Vocal);
+        assert_eq!(timbre(48).1, Voicing::Sustained, "strings are not sung");
+        assert_eq!(timbre(0).1, Voicing::Plucked, "a piano is struck");
     }
 
     #[test]
