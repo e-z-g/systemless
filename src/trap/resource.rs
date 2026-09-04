@@ -269,6 +269,7 @@ fn is_builtin_gestalt_selector(sel: &[u8; 4]) -> bool {
             | b"rsrc"
             | b"scr#"
             | b"qtim"
+            | b"cpnt"
             | b"drag"
             | b"os  "
             | b"powr"
@@ -3834,6 +3835,26 @@ impl super::TrapDispatcher {
                     // the release byte as 0x80 for a final release.
                     b"qtim" => {
                         cpu.write_reg(Register::A0, QUICKTIME_NUM_VERSION_6_0_FINAL);
+                        cpu.write_reg(Register::D0, 0); // noErr
+                    }
+                    // gestaltComponentMgr ('cpnt') -> Component Manager
+                    // version. Inside Macintosh: More Macintosh Toolbox
+                    // (1993), p. 6-8: the response is the manager's version,
+                    // and any non-zero version means the manager is present.
+                    // Version 1 is the original Component Manager; 3 and
+                    // above add automatic version control, unregistration and
+                    // icon families, none of which this host provides, so 1
+                    // is the honest answer.
+                    //
+                    // This is a capability gate, not a feature word: an
+                    // application that gets gestaltUndefSelectorErr here
+                    // concludes the Component Manager is absent and disables
+                    // every path that would reach $A82A, including paths the
+                    // host does serve. Cythera's GMSInit is exactly that --
+                    // one Gestalt('cpnt') decides whether the game has music
+                    // for the rest of the run.
+                    b"cpnt" => {
+                        cpu.write_reg(Register::A0, 1);
                         cpu.write_reg(Register::D0, 0); // noErr
                     }
                     // gestaltDragMgrAttr ('drag') -> Drag Manager attrs.
@@ -14503,6 +14524,24 @@ mod tests {
 
         assert_eq!(cpu.read_reg(Register::A0), 1);
         assert_eq!(cpu.read_reg(Register::D0), 0);
+    }
+
+    #[test]
+    fn gestalt_component_manager_reports_present_because_the_host_serves_it() {
+        // The host implements ComponentDispatch ($A82A), so answering
+        // gestaltUndefSelectorErr to 'cpnt' told every application that the
+        // manager it does serve is absent. Cythera's GMSInit takes that one
+        // answer as final and disables its audio path for the whole run
+        // without ever attempting a component call.
+        let (mut disp, mut cpu, mut bus) = setup();
+
+        cpu.write_reg(Register::A0, 0xBEEF);
+        cpu.write_reg(Register::D0, u32::from_be_bytes(*b"cpnt"));
+
+        call(&mut disp, false, 0xAD, &mut cpu, &mut bus).unwrap();
+
+        assert_eq!(cpu.read_reg(Register::A0), 1, "Component Manager version");
+        assert_eq!(cpu.read_reg(Register::D0), 0, "noErr");
     }
 
     #[test]
