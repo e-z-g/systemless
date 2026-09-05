@@ -1676,6 +1676,11 @@ pub struct FixtureRunnerConfig {
     /// retain their architecture default unless
     /// [`FixtureRunner::set_powerpc_screen_depth`] is called explicitly.
     pub screen_depth: u16,
+    /// Visible screen size in pixels. `None` takes the reference machine
+    /// profile, which `SYSTEMLESS_SCREEN_WIDTH` and `SYSTEMLESS_SCREEN_HEIGHT`
+    /// can override; a host with no environment to set, such as a browser,
+    /// names the size here instead.
+    pub screen_size: Option<(u16, u16)>,
 }
 
 impl Default for FixtureRunnerConfig {
@@ -1689,6 +1694,7 @@ impl Default for FixtureRunnerConfig {
             theme_metrics_mode: ThemeMetricsMode::ClassicGuestMetrics,
             addressing_32_bit: true,
             screen_depth: 8,
+            screen_size: None,
         }
     }
 }
@@ -1987,14 +1993,17 @@ impl FixtureRunner {
             crate::memory::globals::DEFAULT_MENU_FLASH_COUNT,
         );
         let profile = crate::machine_profile::reference_machine_profile();
+        let (screen_width, screen_height) = config
+            .screen_size
+            .unwrap_or((profile.screen_width, profile.screen_height));
         let visible_row_bytes =
-            (u32::from(profile.screen_width) * u32::from(config.screen_depth)).div_ceil(8);
+            (u32::from(screen_width) * u32::from(config.screen_depth)).div_ceil(8);
         let row_bytes = (visible_row_bytes / 16 + 1) * 16;
         dispatcher.screen_mode = (
             bus.read_long(crate::memory::globals::addr::SCRN_BASE),
             row_bytes,
-            profile.screen_width,
-            profile.screen_height,
+            screen_width,
+            screen_height,
             config.screen_depth,
         );
         let (clut, _) = TrapDispatcher::standard_mac_indexed_clut(config.screen_depth)
@@ -3455,6 +3464,7 @@ impl FixtureRunner {
             theme_metrics_mode: self.config.theme_metrics_mode,
             addressing_32_bit: self.bus.addressing_32_bit(),
             screen_depth: self.config.screen_depth,
+            screen_size: self.config.screen_size,
         };
         let menu_bar_policy = self.dispatcher.menu_bar_policy;
         let menu_bar_hidden = self.dispatcher.menu_bar_hidden;
@@ -25607,5 +25617,30 @@ mod tests {
             out[0].1.contains("NOP"),
             "mapped RAM above 8 MiB must not be reported as unmapped"
         );
+    }
+}
+
+#[cfg(test)]
+mod screen_size_config_tests {
+    use super::{FixtureRunner, FixtureRunnerConfig};
+
+    #[test]
+    fn the_config_can_name_the_screen_size() {
+        let config = FixtureRunnerConfig {
+            screen_size: Some((640, 1200)),
+            ..FixtureRunnerConfig::default()
+        };
+        let runner = FixtureRunner::new(8 * 1024 * 1024, config);
+        let (_, row_bytes, width, height, depth) = runner.dispatcher().screen_mode;
+        assert_eq!((width, height, depth), (640, 1200, 8));
+        assert!(row_bytes >= 640 && row_bytes % 16 == 0, "row_bytes {row_bytes}");
+    }
+
+    #[test]
+    fn without_a_size_the_profile_decides() {
+        let runner = FixtureRunner::new(8 * 1024 * 1024, FixtureRunnerConfig::default());
+        let profile = crate::machine_profile::reference_machine_profile();
+        let (_, _, width, height, _) = runner.dispatcher().screen_mode;
+        assert_eq!((width, height), (profile.screen_width, profile.screen_height));
     }
 }
