@@ -3075,6 +3075,7 @@ impl FixtureRunner {
             || self.process_context.menu_tracking().is_some()
             || self.dispatcher.is_dialog_tracking()
             || self.dispatcher.is_control_tracking()
+            || self.dispatcher.scrollbar_thumb_tracking.is_some()
             || self.dispatcher.is_window_tracking()
             || self.dispatcher.is_grow_window_tracking()
             || self.dispatcher.is_region_tracking()
