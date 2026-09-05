@@ -153,11 +153,13 @@ struct Cli {
     #[arg(long, value_name = "N", default_value_t = 1, value_parser = parse_display_scale)]
     display_scale: u32,
 
-    /// Guest chrome theme
+    /// Guest chrome theme. This fork defaults to the classic look: every
+    /// reference capture it is checked against was taken under Mac OS 8, and
+    /// the system-supplied dialogs, menus and alerts should match them.
     #[arg(
         long,
         value_name = "THEME",
-        default_value = "systemless-default",
+        default_value = "classic-system7",
         value_parser = UiThemeId::parse
     )]
     ui_theme: UiThemeId,
@@ -3351,12 +3353,12 @@ mod tests {
     }
 
     #[test]
-    fn cli_defaults_to_one_physical_host_pixel_and_systemless_theme() {
+    fn cli_defaults_to_one_physical_host_pixel_and_classic_theme() {
         let cli = Cli::try_parse_from(["systemless", "game.sit"])
             .expect("default display scale should parse");
         assert_eq!(cli.display_scale, 1);
         assert_eq!(cli.screen_depth, None);
-        assert_eq!(cli.ui_theme, UiThemeId::SystemlessDefault);
+        assert_eq!(cli.ui_theme, UiThemeId::ClassicSystem7);
         assert_eq!(
             guest_scaled_physical_size(800, 600, cli.display_scale),
             winit::dpi::PhysicalSize::new(800, 600)
