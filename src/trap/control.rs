@@ -1528,6 +1528,12 @@ impl super::TrapDispatcher {
                     bus, abs_top, abs_left, abs_bottom, abs_right, value, min, max, hilite,
                 );
             }
+            proc_id if Self::is_slider_proc_id(proc_id) => {
+                self.draw_slider_control(
+                    bus, abs_top, abs_left, abs_bottom, abs_right, value, min, max, hilite,
+                    proc_id,
+                );
+            }
             proc_id if Self::is_popup_menu_proc_id(proc_id) => {
                 // popupMenuProc — draw the CNTL-backed popup button using
                 // the selected MENU resource item.
@@ -1925,6 +1931,110 @@ impl super::TrapDispatcher {
 
     /// Draw a scroll bar control.
     /// Inside Macintosh Volume I, I-332 (scroll bar CDEF)
+    /// kControlSliderProc (48) and its variants: bit 0 live feedback, bit 1
+    /// tick marks, bit 2 reverse direction, bit 3 non-directional
+    /// (ControlDefinitions.h). Appearance Manager 1.0, so Mac OS 8.
+    pub(crate) fn is_slider_proc_id(proc_id: i16) -> bool {
+        (48..=63).contains(&proc_id)
+    }
+
+    /// Thumb length along the track, in pixels.
+    pub(crate) const SLIDER_THUMB_SIZE: i16 = 12;
+
+    /// Draw an Appearance slider: a recessed track along the long axis, the
+    /// thumb at the value's position, and a tick per integer value when the
+    /// variant asks for them and the range is small enough to show them.
+    /// Cythera's Preferences dialog is the customer: two volume sliders and a
+    /// three-stop Graphics Quality slider that had been drawn as push buttons
+    /// by the unknown-procID fallback, with nothing to grab.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn draw_slider_control(
+        &self,
+        bus: &mut MacMemoryBus,
+        top: i16,
+        left: i16,
+        bottom: i16,
+        right: i16,
+        value: i16,
+        min: i16,
+        max: i16,
+        hilite: u8,
+        proc_id: i16,
+    ) {
+        let (screen_base, row_bytes, screen_width, screen_height, pixel_size) =
+            self.get_screen_params();
+        let is_vertical = (bottom - top) > (right - left);
+        let inactive = hilite == 255 || min >= max;
+        let has_ticks = proc_id & 2 != 0;
+        let thumb = Self::SLIDER_THUMB_SIZE;
+        let fill = |bus: &mut MacMemoryBus, t: i16, l: i16, b: i16, r: i16, black: bool| {
+            if b > t && r > l {
+                Self::fb_fill_rect(
+                    bus, screen_base, row_bytes, pixel_size, screen_width, screen_height, t, l,
+                    b, r, black,
+                );
+            }
+        };
+        // Clear the control's own rectangle so a moved thumb leaves nothing.
+        fill(bus, top, left, bottom, right, false);
+
+        let (track_start, track_end) = if is_vertical {
+            (top, bottom)
+        } else {
+            (left, right)
+        };
+        let travel = (track_end - track_start - thumb).max(0);
+        let range = i32::from(max) - i32::from(min);
+        let rel = if range > 0 {
+            (i32::from(value.clamp(min, max)) - i32::from(min)) * i32::from(travel) / range
+        } else {
+            0
+        };
+        let thumb_pos = track_start + rel as i16;
+
+        // The track: a groove 4 pixels across, centred on the short axis,
+        // framed in black with a white floor.
+        let (ctr_a, ctr_b) = if is_vertical {
+            ((left + right) / 2 - 2, (left + right) / 2 + 2)
+        } else {
+            ((top + bottom) / 2 - 2, (top + bottom) / 2 + 2)
+        };
+        let groove = if is_vertical {
+            (track_start + thumb / 2, ctr_a, track_end - thumb / 2, ctr_b)
+        } else {
+            (ctr_a, track_start + thumb / 2, ctr_b, track_end - thumb / 2)
+        };
+        self.draw_rect_border(bus, groove.0, groove.1, groove.2, groove.3);
+        if inactive {
+            return;
+        }
+        // Tick marks below (or right of) the groove, one per value.
+        if has_ticks && range > 0 && range <= 16 {
+            for i in 0..=range {
+                let at = track_start + thumb / 2 + (i * i32::from(travel) / range) as i16;
+                if is_vertical {
+                    self.draw_hline(bus, at, ctr_b + 2, (ctr_b + 5).min(right));
+                } else {
+                    self.draw_vline(bus, at, ctr_b + 2, (ctr_b + 5).min(bottom));
+                }
+            }
+        }
+        // The thumb: a framed white box the full short axis of the control,
+        // less the tick row, with a centre line for the finger to aim at.
+        let (t_top, t_left, t_bottom, t_right) = if is_vertical {
+            (thumb_pos, left, thumb_pos + thumb, right.min(ctr_b + 1).max(left + 4))
+        } else {
+            (top, thumb_pos, bottom.min(ctr_b + 1).max(top + 4), thumb_pos + thumb)
+        };
+        fill(bus, t_top, t_left, t_bottom, t_right, false);
+        self.draw_rect_border(bus, t_top, t_left, t_bottom, t_right);
+        if is_vertical {
+            self.draw_hline(bus, (t_top + t_bottom) / 2, t_left + 2, t_right - 2);
+        } else {
+            self.draw_vline(bus, (t_left + t_right) / 2, t_top + 2, t_bottom - 2);
+        }
+    }
+
     pub(crate) fn draw_scroll_bar(
         &self,
         bus: &mut MacMemoryBus,
@@ -3400,6 +3510,7 @@ impl super::TrapDispatcher {
                                 16 => self.standard_scrollbar_testcontrol_part_code(
                                     bus, ctrl_ptr, pt_v, pt_h,
                                 ),
+                                p if Self::is_slider_proc_id(p) => 129,
                                 _ => self.standard_testcontrol_part_code(ctrl_ptr),
                             };
                         }
@@ -3677,6 +3788,75 @@ impl super::TrapDispatcher {
                             if pt_v >= r_top && pt_v < r_bottom && pt_h >= r_left && pt_h < r_right
                             {
                                 let proc_id = self.control_manager.proc_id(ctrl_ptr);
+                                if Self::is_slider_proc_id(proc_id) {
+                                    // An Appearance slider is all indicator. The
+                                    // thumb moves to the pointer on the click
+                                    // and follows it from there, and the value
+                                    // is set on release by the same completion
+                                    // path as a scroll bar's thumb.
+                                    self.record_trackcontrol_input_trace(
+                                        bus, "start", ctrl_handle, Some((pt_v, pt_h)),
+                                        action_proc, Some(129), None, "slider_thumb",
+                                    );
+                                    if !self.input_state.mouse_button {
+                                        bus.write_word(sp + 12, 129);
+                                        cpu.write_reg(Register::A7, sp + 12);
+                                        return Some(Ok(()));
+                                    }
+                                    let window_ptr = bus.read_long(ctrl_ptr + 4);
+                                    let (scr_top, scr_left, _, _) =
+                                        Self::dialog_screen_bounds(bus, window_ptr);
+                                    let val = bus.read_word(ctrl_ptr + 18) as i16;
+                                    let min = bus.read_word(ctrl_ptr + 20) as i16;
+                                    let max = bus.read_word(ctrl_ptr + 22) as i16;
+                                    let is_vertical = (r_bottom - r_top) > (r_right - r_left);
+                                    let thumb_size = Self::SLIDER_THUMB_SIZE;
+                                    let (track_start, track_end, cross_start, cross_end) =
+                                        if is_vertical {
+                                            (scr_top + r_top, scr_top + r_bottom, scr_left + r_left, scr_left + r_right)
+                                        } else {
+                                            (scr_left + r_left, scr_left + r_right, scr_top + r_top, scr_top + r_bottom)
+                                        };
+                                    let travel = (track_end - track_start - thumb_size).max(0);
+                                    let mouse = (pt_v + scr_top, pt_h + scr_left);
+                                    let mouse_axis = if is_vertical { mouse.0 } else { mouse.1 };
+                                    let thumb_pos = (mouse_axis - thumb_size / 2)
+                                        .clamp(track_start, track_start + travel);
+                                    let slop_rect = (
+                                        scr_top + r_top - 30,
+                                        scr_left + r_left - 30,
+                                        scr_top + r_bottom + 30,
+                                        scr_left + r_right + 30,
+                                    );
+                                    let outline = if is_vertical {
+                                        (thumb_pos, cross_start, thumb_pos + thumb_size, cross_end)
+                                    } else {
+                                        (cross_start, thumb_pos, cross_end, thumb_pos + thumb_size)
+                                    };
+                                    let saved_pixels = self.save_window_drag_outline_pixels(bus, outline);
+                                    self.draw_drag_outline_pattern(bus, outline, Self::GRAY_DRAG_PATTERN);
+                                    self.scrollbar_thumb_tracking = Some(super::dispatch::ScrollbarThumbTrackingState {
+                                        _ctrl_handle: ctrl_handle,
+                                        ctrl_ptr,
+                                        stack_ptr: sp,
+                                        start_mouse: mouse,
+                                        start_thumb_pos: thumb_pos,
+                                        start_value: val,
+                                        min,
+                                        max,
+                                        track_start,
+                                        travel,
+                                        cross_start,
+                                        cross_end,
+                                        is_vertical,
+                                        thumb_size,
+                                        slop_rect,
+                                        outline_rect: Some(outline),
+                                        saved_pixels,
+                                    });
+                                    cpu.write_reg(Register::A7, sp);
+                                    return Some(Ok(()));
+                                }
                                 if proc_id == 16 {
                                     part = self.standard_scrollbar_testcontrol_part_code(
                                         bus, ctrl_ptr, pt_v, pt_h,
@@ -4688,6 +4868,7 @@ impl super::TrapDispatcher {
                                         16 => self.standard_scrollbar_testcontrol_part_code(
                                             bus, ctrl_ptr, pt_v, pt_h,
                                         ),
+                                        p if Self::is_slider_proc_id(p) => 129,
                                         _ => self.standard_testcontrol_part_code(ctrl_ptr),
                                     };
                                     (ctrl_handle, part)
@@ -6504,6 +6685,74 @@ mod tests {
         let trace = disp.input_trace_text();
         assert!(trace.contains("A968 action=start start=(15,25)"));
         assert!(trace.contains("part=10 highlighted_item=none outcome=visible_active_hit"));
+    }
+
+    // An Appearance slider (kControlSliderProc) is all indicator: the click
+    // puts the thumb under the pointer, the drag follows it, and the value is
+    // set on release from the thumb's final position. ControlDefinitions.h;
+    // the customer is Cythera's Preferences dialog.
+    #[test]
+    fn track_control_slider_moves_the_thumb_to_the_pointer_and_sets_the_value_on_release() {
+        let (mut disp, mut cpu, mut bus) = setup();
+        let sp = 0x300000u32;
+        let trap_pc = 0x0012_3454;
+        let (ctrl_handle, ctrl_ptr) =
+            alloc_scrollbar_control(&mut disp, &mut bus, (100, 100, 116, 220), 255, 0, 0, 0, 2);
+        disp.control_manager.set_proc_id(ctrl_ptr, 50); // slider, with tick marks
+
+        // Mouse down near the right end of the track.
+        disp.input_state.mouse_button = true;
+        disp.input_state.mouse_pos = (108, 212);
+        bus.write_byte(crate::memory::globals::addr::MB_STATE, 0x00);
+        cpu.write_reg(Register::PC, trap_pc + 2);
+        cpu.write_reg(Register::A7, sp);
+        bus.write_long(sp, 0);
+        bus.write_word(sp + 4, 108);
+        bus.write_word(sp + 6, 212);
+        bus.write_long(sp + 8, ctrl_handle);
+        bus.write_word(sp + 12, 0xBEEF);
+        disp.dispatch_control(true, 0x168, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert!(
+            disp.scrollbar_thumb_tracking.is_some(),
+            "TrackControl is retained while the button is down"
+        );
+        assert_eq!(cpu.read_reg(Register::A7), sp, "the frame stays for the refire");
+        assert_eq!(bus.read_word(ctrl_ptr + 18), 0, "the value waits for the release");
+
+        // Release where the pointer is.
+        disp.input_state.mouse_button = false;
+        bus.write_byte(crate::memory::globals::addr::MB_STATE, 0x80);
+        cpu.write_reg(Register::PC, trap_pc + 2);
+        cpu.write_reg(Register::A7, sp);
+        disp.dispatch_control(true, 0x168, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert!(disp.scrollbar_thumb_tracking.is_none());
+        assert_eq!(bus.read_word(sp + 12), 129, "the indicator part is reported");
+        assert_eq!(cpu.read_reg(Register::A7), sp + 12, "the Pascal frame is popped");
+        assert_eq!(bus.read_word(ctrl_ptr + 18) as i16, 2, "the right end of 0..2 is 2");
+
+        // A click in the middle of the track lands on the middle stop.
+        disp.input_state.mouse_button = true;
+        disp.input_state.mouse_pos = (108, 160);
+        bus.write_byte(crate::memory::globals::addr::MB_STATE, 0x00);
+        cpu.write_reg(Register::PC, trap_pc + 2);
+        cpu.write_reg(Register::A7, sp);
+        bus.write_word(sp + 4, 108);
+        bus.write_word(sp + 6, 160);
+        disp.dispatch_control(true, 0x168, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        disp.input_state.mouse_button = false;
+        bus.write_byte(crate::memory::globals::addr::MB_STATE, 0x80);
+        cpu.write_reg(Register::PC, trap_pc + 2);
+        cpu.write_reg(Register::A7, sp);
+        disp.dispatch_control(true, 0x168, &mut cpu, &mut bus)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.read_word(ctrl_ptr + 18) as i16, 1, "the middle of 0..2 is 1");
     }
 
     #[test]
