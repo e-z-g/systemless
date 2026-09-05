@@ -12,6 +12,49 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasherDefault;
+
+/// Hasher for the kernel's tables, which are keyed by small integer
+/// identities (`ExecutionTaskId`, `CallId`). The default SipHash was 40% of
+/// a 68K run: `execution_route` consults three of these tables at every batch
+/// boundary, and a batch ends at every trap. A multiply-and-rotate over the
+/// integer is enough to spread the bits hashbrown wants and costs nothing.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct IdHasher(u64);
+
+impl IdHasher {
+    #[inline]
+    fn mix(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(29) ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+impl std::hash::Hasher for IdHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0 ^ (self.0 >> 32)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.mix(u64::from(byte));
+        }
+    }
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.mix(u64::from(value));
+    }
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.mix(value);
+    }
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.mix(value as u64);
+    }
+}
+
+type IdMap<K, V> = HashMap<K, V, BuildHasherDefault<IdHasher>>;
+type IdSet<K> = HashSet<K, BuildHasherDefault<IdHasher>>;
 use std::rc::Rc;
 
 use crate::guest_procedure::GuestIsa;
@@ -444,11 +487,11 @@ struct StoreState<R: Copy, C: Copy> {
     current_task: ExecutionTaskId,
     next_call_id: u64,
     next_task_id: Option<u32>,
-    stacks: HashMap<ExecutionTaskId, Vec<ContinuationState<R, C>>>,
-    attached_contexts: HashMap<CallId, usize>,
-    retired_tasks: HashSet<ExecutionTaskId>,
-    task_states: HashMap<ExecutionTaskId, ExecutionTaskState>,
-    task_entry_isas: HashMap<ExecutionTaskId, GuestIsa>,
+    stacks: IdMap<ExecutionTaskId, Vec<ContinuationState<R, C>>>,
+    attached_contexts: IdMap<CallId, usize>,
+    retired_tasks: IdSet<ExecutionTaskId>,
+    task_states: IdMap<ExecutionTaskId, ExecutionTaskState>,
+    task_entry_isas: IdMap<ExecutionTaskId, GuestIsa>,
     ready: VecDeque<ExecutionTaskId>,
     critical_depth: u32,
 }
@@ -459,14 +502,14 @@ impl<R: Copy, C: Copy> Default for StoreState<R, C> {
             current_task: ExecutionTaskId::APPLICATION,
             next_call_id: 1,
             next_task_id: Some(3),
-            stacks: HashMap::from([(ExecutionTaskId::APPLICATION, Vec::new())]),
-            attached_contexts: HashMap::new(),
-            retired_tasks: HashSet::new(),
-            task_states: HashMap::from([(
+            stacks: IdMap::from_iter([(ExecutionTaskId::APPLICATION, Vec::new())]),
+            attached_contexts: IdMap::default(),
+            retired_tasks: IdSet::default(),
+            task_states: IdMap::from_iter([(
                 ExecutionTaskId::APPLICATION,
                 ExecutionTaskState::Running,
             )]),
-            task_entry_isas: HashMap::new(),
+            task_entry_isas: IdMap::default(),
             ready: VecDeque::new(),
             critical_depth: 0,
         }
@@ -1119,20 +1162,20 @@ impl<R: Copy + TaskOwned, C: Copy> ContinuationStore<R, C> {
 /// Inside Macintosh: PowerPC System Software (1994), pp. 2-9--2-13.
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutionContextBank<T> {
-    by_call: HashMap<(ExecutionTaskId, CallId), T>,
+    by_call: IdMap<(ExecutionTaskId, CallId), T>,
 }
 
 /// Process-task snapshots keyed by the same stable identities as
 /// continuations and parked ISA contexts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExecutionTaskContextBank<T> {
-    by_task: HashMap<ExecutionTaskId, T>,
+    by_task: IdMap<ExecutionTaskId, T>,
 }
 
 impl<T> Default for ExecutionContextBank<T> {
     fn default() -> Self {
         Self {
-            by_call: HashMap::new(),
+            by_call: IdMap::default(),
         }
     }
 }
@@ -1140,7 +1183,7 @@ impl<T> Default for ExecutionContextBank<T> {
 impl<T> Default for ExecutionTaskContextBank<T> {
     fn default() -> Self {
         Self {
-            by_task: HashMap::new(),
+            by_task: IdMap::default(),
         }
     }
 }
