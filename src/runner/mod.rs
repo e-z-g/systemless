@@ -1980,7 +1980,11 @@ impl FixtureRunner {
         dispatcher.set_menu_bar_policy(config.menu_bar_policy);
         dispatcher.mmu_mode = u8::from(config.addressing_32_bit);
         dispatcher.set_ui_theme_id(config.ui_theme);
-        let mut bus = MacMemoryBus::new(ram_size);
+        let profile = crate::machine_profile::reference_machine_profile();
+        let (screen_width, screen_height) = config
+            .screen_size
+            .unwrap_or((profile.screen_width, profile.screen_height));
+        let mut bus = MacMemoryBus::new_with_screen(ram_size, screen_width, screen_height);
         bus.set_addressing_32_bit(config.addressing_32_bit);
         bus.configure_screen_depth(config.screen_depth);
         process_context.attach_classic_memory_bus(&mut bus);
@@ -1992,10 +1996,6 @@ impl FixtureRunner {
             crate::memory::globals::addr::MENU_FLASH,
             crate::memory::globals::DEFAULT_MENU_FLASH_COUNT,
         );
-        let profile = crate::machine_profile::reference_machine_profile();
-        let (screen_width, screen_height) = config
-            .screen_size
-            .unwrap_or((profile.screen_width, profile.screen_height));
         let visible_row_bytes =
             (u32::from(screen_width) * u32::from(config.screen_depth)).div_ceil(8);
         let row_bytes = (visible_row_bytes / 16 + 1) * 16;
@@ -25623,6 +25623,7 @@ mod tests {
 #[cfg(test)]
 mod screen_size_config_tests {
     use super::{FixtureRunner, FixtureRunnerConfig};
+    use crate::memory::bus::MemoryBus;
 
     #[test]
     fn the_config_can_name_the_screen_size() {
@@ -25631,9 +25632,14 @@ mod screen_size_config_tests {
             ..FixtureRunnerConfig::default()
         };
         let runner = FixtureRunner::new(8 * 1024 * 1024, config);
-        let (_, row_bytes, width, height, depth) = runner.dispatcher().screen_mode;
+        let (base, row_bytes, width, height, depth) = runner.dispatcher().screen_mode;
         assert_eq!((width, height, depth), (640, 1200, 8));
         assert!(row_bytes >= 640 && row_bytes % 16 == 0, "row_bytes {row_bytes}");
+        // The whole screen, and the sound buffer after it, lie inside RAM.
+        let end = base + row_bytes * u32::from(height);
+        assert!(end <= 8 * 1024 * 1024, "screen ends at {end:#x}");
+        let sound_base = runner.bus().read_long(crate::memory::globals::addr::SOUND_BASE);
+        assert!(sound_base >= end, "sound buffer {sound_base:#x} overlaps the screen ending {end:#x}");
     }
 
     #[test]

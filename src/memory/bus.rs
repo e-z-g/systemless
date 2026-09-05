@@ -1137,16 +1137,41 @@ impl MacMemoryBus {
         }
     }
 
-    /// Create a new memory bus with the given RAM size
+    /// Row bytes of an 8-bit screen `width` pixels wide: the visible bytes
+    /// rounded up to the next multiple of 16 (800 -> 816).
+    fn screen_row_bytes_for_width(width: u16) -> u32 {
+        (u32::from(width) / 16 + 1) * 16
+    }
+
+    /// Bytes reserved at the top of RAM for the screen and the legacy sound
+    /// buffer. 512 KB has always been the reservation and still is for
+    /// anything that fits in it (800x600 at 8 bpp is 489,600 bytes); a
+    /// larger screen takes what it needs, rounded up to 64 KB.
+    fn screen_reserve_bytes(ram_size: usize, width: u16, height: u16) -> u32 {
+        if ram_size < 0x20000 {
+            return 0;
+        }
+        if ram_size < 0x100000 {
+            return 0x10000;
+        }
+        let needed = Self::screen_row_bytes_for_width(width) * u32::from(height)
+            + LEGACY_SOUND_BUFFER_BYTES;
+        let rounded = needed.div_ceil(0x10000) * 0x10000;
+        rounded.max(0x80000).min(ram_size as u32 / 2)
+    }
+
+    /// Create a new memory bus with the given RAM size and the default
+    /// 800x600 screen.
     pub fn new(ram_size: usize) -> Self {
+        Self::new_with_screen(ram_size, 800, 600)
+    }
+
+    /// Create a new memory bus with the given RAM size and an 8-bit screen of
+    /// `width` x `height` pixels at the top of RAM.
+    pub fn new_with_screen(ram_size: usize, width: u16, height: u16) -> Self {
         // Screen buffer is at the top of RAM; heap must not grow into it.
-        let screen_buffer_start: u32 = if ram_size >= 0x100000 {
-            (ram_size as u32) - 0x80000
-        } else if ram_size >= 0x20000 {
-            (ram_size as u32) - 0x10000
-        } else {
-            ram_size as u32
-        };
+        let screen_buffer_start: u32 =
+            (ram_size as u32) - Self::screen_reserve_bytes(ram_size, width, height);
         let synthetic_floor = screen_buffer_start.saturating_sub(SYNTHETIC_RESERVE_BYTES);
         let mut bus = Self {
             ram: RamStorage::Owned(vec![0; ram_size]),
@@ -1167,20 +1192,17 @@ impl MacMemoryBus {
         };
         bus.write_word(super::globals::addr::ROM85, 0x7FFF);
 
-        // Set up ScrnBase at $0824 to point to screen memory.
-        // Default to 800x600 8bpp color mode. The framebuffer is placed at
-        // the top of RAM minus 512KB (0x80000), which fits 800*600 = 480,000 bytes.
-        // For small RAM sizes (unit tests), fall back to a safe address.
-        let screen_base: u32 = if ram_size >= 0x100000 {
-            (ram_size as u32) - 0x80000
-        } else if ram_size >= 0x20000 {
-            (ram_size as u32) - 0x10000
+        // Set up ScrnBase at $0824 to point to screen memory: 8bpp, at the
+        // top of RAM behind the reservation `screen_reserve_bytes` sized for
+        // it. For small RAM sizes (unit tests), fall back to a safe address.
+        let screen_base: u32 = if ram_size >= 0x20000 {
+            screen_buffer_start
         } else {
             0 // Fallback for unit tests with small RAM
         };
-        let screen_row_bytes: u16 = 816;
-        let screen_width: u16 = 800;
-        let screen_height: u16 = 600;
+        let screen_row_bytes: u16 = Self::screen_row_bytes_for_width(width) as u16;
+        let screen_width: u16 = width;
+        let screen_height: u16 = height;
 
         // ScrnBase ($0824) - pointer to screen buffer
         bus.write_long(0x0824, screen_base);
@@ -1220,8 +1242,9 @@ impl MacMemoryBus {
 
     pub(crate) fn configure_screen_depth(&mut self, depth: u16) {
         debug_assert!(matches!(depth, 1 | 2 | 4 | 8));
-        let profile = crate::machine_profile::reference_machine_profile();
-        let visible_row_bytes = (u32::from(profile.screen_width) * u32::from(depth)).div_ceil(8);
+        // The width the bus was built with: screenBits.bounds.right.
+        let screen_width = self.read_word(super::globals::addr::SCREEN_BITS + 12);
+        let visible_row_bytes = (u32::from(screen_width) * u32::from(depth)).div_ceil(8);
         let row_bytes = (visible_row_bytes / 16 + 1) * 16;
         self.write_word(super::globals::addr::SCREEN_ROW, row_bytes as u16);
         self.write_word(super::globals::addr::SCREEN_BITS + 4, row_bytes as u16);
